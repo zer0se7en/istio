@@ -42,9 +42,7 @@ case, just typing ```go test ./...``` should be sufficient to run tests.
 ## Writing Tests
 
 The test framework is designed to work with standard go tooling and allows developers
-to write environment-agnostics tests in a high-level fashion. The quickest way to get started with authoring
-new tests is to checkout the code in the
-[framework](https://github.com/istio/istio/tree/master/tests/integration/framework) folder.
+to write environment-agnostics tests in a high-level fashion.
 
 ### Adding a Test Suite
 
@@ -353,13 +351,12 @@ the standard `go test` command-line.  For example, to run the tests under the `/
 using the default (native) environment, you can simply type:
 
 ```console
-$ go test ./tests/integration/mycomponent/...
+$ go test -tags=integ ./tests/integration/mycomponent/...
 ```
 
 Note that samples below invoking variations of ```go test ./...``` are intended to be run from the ```tests/integration``` directory.
 
-| WARNING: Many tests, including integration tests, assume that a [Helm](https://helm.sh/docs/using_helm/#installing-helm) client is installed and on the path.|
-| --- |
+Tests are tagged with the `integ` build target to avoid accidental invocation. If this is not set, no tests will be run.
 
 ### Test Parellelism and Kubernetes
 
@@ -512,11 +509,6 @@ pass command-line flags to the test while running under the debugger, you can us
 
 ## Reference
 
-### Helm Values Overrides
-
-If your tests require special Helm values flags, you can specify your Helm values via additional
-for Kubernetes environments. See [mtls_healthcheck_test.go](security/healthcheck/mtls_healthcheck_test.go) for example.
-
 ### Command-Line Flags
 
 The test framework supports the following command-line flags:
@@ -566,6 +558,12 @@ The test framework supports the following command-line flags:
 
   -istio.test.kube.loadbalancer bool
         Used to obtain the right IP address for ingress gateway. This should be false for any environment that doesn't support a LoadBalancer type.
+
+  -istio.test.revision string
+        Overwrite the default namespace label (istio-enabled=true) with revision lable (istio.io/rev=XXX). (default is no overwrite)
+
+  -istio.test.skipVM bool
+        Skip all the VM related parts in all the tests. (default is "false")
 ```
 
 }

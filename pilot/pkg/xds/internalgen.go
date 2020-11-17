@@ -23,10 +23,13 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/any"
 	structpb "github.com/golang/protobuf/ptypes/struct"
+	"golang.org/x/time/rate"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pkg/queue"
 	"istio.io/pkg/log"
 )
 
@@ -52,8 +55,23 @@ const (
 type InternalGen struct {
 	Server *DiscoveryServer
 
+	// TODO move WorkloadEntry related tasks into their own object and give InternalGen a reference.
+	// store should either be k8s (for running pilot) or in-memory (for tests). MCP and other config store implementations
+	// do not support writing. We only use it here for reading WorkloadEntry/WorkloadGroup.
+	store model.ConfigStoreCache
+	// cleanupLimit rate limit's autoregistered WorkloadEntry cleanup calls to k8s
+	cleanupLimit *rate.Limiter
+	// cleanupQueue delays the cleanup of autoregsitered WorkloadEntries to allow for grace period
+	cleanupQueue queue.Delayed
+
 	// TODO: track last N Nacks and connection events, with 'version' based on timestamp.
 	// On new connect, use version to send recent events since last update.
+}
+
+func NewInternalGen(s *DiscoveryServer) *InternalGen {
+	return &InternalGen{
+		Server: s,
+	}
 }
 
 func (sg *InternalGen) OnConnect(con *Connection) {
@@ -73,6 +91,8 @@ func (sg *InternalGen) OnConnect(con *Connection) {
 }
 
 func (sg *InternalGen) OnDisconnect(con *Connection) {
+	sg.QueueUnregisterWorkload(con.proxy)
+
 	sg.startPush(TypeURLDisconnect, []proto.Message{con.node})
 
 	if con.node.Metadata != nil && con.node.Metadata.Fields != nil {
@@ -86,8 +106,26 @@ func (sg *InternalGen) OnDisconnect(con *Connection) {
 	// Note that it is quite possible for a 'connect' on a different istiod to happen before a disconnect.
 }
 
+func (sg *InternalGen) EnableWorkloadEntryController(store model.ConfigStoreCache) {
+	if features.WorkloadEntryAutoRegistration || features.WorkloadEntryHealthChecks {
+		sg.store = store
+		sg.cleanupLimit = rate.NewLimiter(rate.Limit(20), 1)
+		sg.cleanupQueue = queue.NewDelayed()
+	}
+}
+
+func (sg *InternalGen) Run(stop <-chan struct{}) {
+	if sg.store != nil && sg.cleanupQueue != nil {
+		go sg.periodicWorkloadEntryCleanup(stop)
+		go sg.cleanupQueue.Run(stop)
+	}
+}
+
 func (sg *InternalGen) OnNack(node *model.Proxy, dr *discovery.DiscoveryRequest) {
 	// Make sure we include the ID - the DR may not include metadata
+	if dr.Node == nil {
+		dr.Node = &core.Node{}
+	}
 	dr.Node.Id = node.ID
 	sg.startPush(TypeURLNACK, []proto.Message{dr})
 }
@@ -103,7 +141,7 @@ func (s *DiscoveryServer) PushAll(res *discovery.DiscoveryResponse) {
 	pending := []*Connection{}
 	for _, v := range s.adsClients {
 		v.proxy.RLock()
-		if v.proxy.ActiveExperimental[res.TypeUrl] != nil {
+		if v.proxy.WatchedResources[res.TypeUrl] != nil {
 			pending = append(pending, v)
 		}
 		v.proxy.RUnlock()
@@ -125,7 +163,7 @@ func (s *DiscoveryServer) PushAll(res *discovery.DiscoveryResponse) {
 		go func() {
 			err := con.stream.Send(res)
 			if err != nil {
-				adsLog.Infoa("Failed to send internal event ", con.ConID, " ", err)
+				adsLog.Info("Failed to send internal event ", con.ConID, " ", err)
 			}
 		}()
 	}
@@ -154,7 +192,7 @@ func (sg *InternalGen) startPush(typeURL string, data []proto.Message) {
 // - NACKs
 //
 // We can also expose ACKS.
-func (sg *InternalGen) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates model.XdsUpdates) model.Resources {
+func (sg *InternalGen) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, req *model.PushRequest) model.Resources {
 	res := []*any.Any{}
 
 	switch w.TypeUrl {
@@ -209,7 +247,7 @@ func (sg *InternalGen) debugSyncz() []*any.Any {
 			xdsConfigs := []*status.PerXdsConfig{}
 			for _, stype := range stypes {
 				pxc := &status.PerXdsConfig{}
-				if watchedResource, ok := con.proxy.Active[stype]; ok {
+				if watchedResource, ok := con.proxy.WatchedResources[stype]; ok {
 					pxc.Status = debugSyncStatus(watchedResource)
 				} else {
 					pxc.Status = status.ConfigStatus_NOT_SENT

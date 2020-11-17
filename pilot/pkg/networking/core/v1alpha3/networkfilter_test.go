@@ -25,6 +25,7 @@ import (
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/protocol"
 )
 
@@ -61,7 +62,7 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 		{
 			"no pattern",
 			"",
-			"inbound|9999|http|v0.default.example.org",
+			"inbound|9999||",
 		},
 		{
 			"service only pattern",
@@ -98,7 +99,7 @@ func TestInboundNetworkFilterStatPrefix(t *testing.T) {
 				Endpoint: &model.IstioEndpoint{},
 			}
 
-			listeners := buildInboundNetworkFilters(env.PushContext, instance)
+			listeners := buildInboundNetworkFilters(env.PushContext, instance, &model.Proxy{})
 			tcp := &tcp.TcpProxy{}
 			ptypes.UnmarshalAny(listeners[0].GetTypedConfig(), tcp)
 			if tcp.StatPrefix != tt.expectedStatPrefix {
@@ -212,7 +213,7 @@ func TestOutboundNetworkFilterStatPrefix(t *testing.T) {
 			proxy.IstioVersion = model.ParseIstioVersion(proxy.Metadata.IstioVersion)
 			proxy.SidecarScope = model.DefaultSidecarScopeForNamespace(env.PushContext, "not-default")
 
-			listeners := buildOutboundNetworkFilters(proxy, tt.routes, env.PushContext, &model.Port{Port: 9999}, model.ConfigMeta{Name: "test.com", Namespace: "ns"})
+			listeners := buildOutboundNetworkFilters(proxy, tt.routes, env.PushContext, &model.Port{Port: 9999}, config.Meta{Name: "test.com", Namespace: "ns"})
 			tcp := &tcp.TcpProxy{}
 			ptypes.UnmarshalAny(listeners[0].GetTypedConfig(), tcp)
 			if tcp.StatPrefix != tt.expectedStatPrefix {

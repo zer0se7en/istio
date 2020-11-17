@@ -15,7 +15,7 @@
 package xds
 
 import (
-	"time"
+	"fmt"
 
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -28,6 +28,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/util/sets"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
@@ -59,12 +60,7 @@ func (s *DiscoveryServer) UpdateServiceShards(push *model.PushContext) error {
 				}
 
 				// This loses track of grouping (shards)
-				instances, err := registry.InstancesByPort(svc, port.Port, labels.Collection{})
-				if err != nil {
-					return err
-				}
-
-				for _, inst := range instances {
+				for _, inst := range registry.InstancesByPort(svc, port.Port, labels.Collection{}) {
 					endpoints = append(endpoints, inst.Endpoint)
 				}
 			}
@@ -228,14 +224,14 @@ func (s *DiscoveryServer) deleteService(cluster, serviceName, namespace string) 
 	}
 }
 
-// loadAssignmentsForCluster return the endpoints for a cluster
+// llbEndpointAndOptionsForCluster return the endpoints for a cluster
 // Initial implementation is computing the endpoints on the flight - caching will be added as needed, based on
 // perf tests.
-func (s *DiscoveryServer) loadAssignmentsForCluster(b EndpointBuilder) *endpoint.ClusterLoadAssignment {
+func (s *DiscoveryServer) llbEndpointAndOptionsForCluster(b EndpointBuilder) ([]*LocLbEndpointsAndOptions, error) {
 	if b.service == nil {
 		// Shouldn't happen here
 		adsLog.Debugf("can not find the service for cluster %s", b.clusterName)
-		return buildEmptyClusterLoadAssignment(b.clusterName)
+		return make([]*LocLbEndpointsAndOptions, 0), nil
 	}
 
 	// Service resolution type might have changed and Cluster may be still in the EDS cluster list of "Connection.Clusters".
@@ -247,14 +243,14 @@ func (s *DiscoveryServer) loadAssignmentsForCluster(b EndpointBuilder) *endpoint
 	// Gateways use EDS for Passthrough cluster. So we should allow Passthrough here.
 	if b.service.Resolution == model.DNSLB {
 		adsLog.Infof("cluster %s in eds cluster, but its resolution now is updated to %v, skipping it.", b.clusterName, b.service.Resolution)
-		return nil
+		return nil, fmt.Errorf("cluster %s in eds cluster", b.clusterName)
 	}
 
 	svcPort, f := b.service.Ports.GetByPort(b.port)
 	if !f {
 		// Shouldn't happen here
 		adsLog.Debugf("can not find the service port %d for cluster %s", b.port, b.clusterName)
-		return buildEmptyClusterLoadAssignment(b.clusterName)
+		return make([]*LocLbEndpointsAndOptions, 0), nil
 	}
 
 	s.mutex.RLock()
@@ -263,33 +259,32 @@ func (s *DiscoveryServer) loadAssignmentsForCluster(b EndpointBuilder) *endpoint
 	if !f {
 		// Shouldn't happen here
 		adsLog.Debugf("can not find the endpointShards for cluster %s", b.clusterName)
-		return buildEmptyClusterLoadAssignment(b.clusterName)
+		return make([]*LocLbEndpointsAndOptions, 0), nil
 	}
 
-	locEps := b.buildLocalityLbEndpointsFromShards(epShards, svcPort)
-
-	return &endpoint.ClusterLoadAssignment{
-		ClusterName: b.clusterName,
-		Endpoints:   locEps,
-	}
+	return b.buildLocalityLbEndpointsFromShards(epShards, svcPort), nil
 }
 
 func (s *DiscoveryServer) generateEndpoints(b EndpointBuilder) *endpoint.ClusterLoadAssignment {
-	l := s.loadAssignmentsForCluster(b)
-	if l == nil {
-		return nil
+	llbOpts, err := s.llbEndpointAndOptionsForCluster(b)
+	if err != nil {
+		return buildEmptyClusterLoadAssignment(b.clusterName)
 	}
 
 	// If networks are set (by default they aren't) apply the Split Horizon
 	// EDS filter on the endpoints
-	if b.push.Networks != nil && len(b.push.Networks.Networks) > 0 {
-		l.Endpoints = EndpointsByNetworkFilter(b.push, b.network, l.Endpoints)
+	if b.MultiNetworkConfigured() {
+		llbOpts = b.EndpointsByNetworkFilter(llbOpts)
 	}
+
+	llbOpts = b.ApplyTunnelSetting(llbOpts, b.tunnelType)
+
+	l := b.createClusterLoadAssignment(llbOpts)
 
 	// If locality aware routing is enabled, prioritize endpoints or set their lb weight.
 	// Failover should only be enabled when there is an outlier detection, otherwise Envoy
 	// will never detect the hosts are unhealthy and redirect traffic.
-	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.destinationRule, b.port, b.subsetName)
+	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
 	lbSetting := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting())
 	if lbSetting != nil {
 		// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
@@ -305,44 +300,45 @@ type EdsGenerator struct {
 	Server *DiscoveryServer
 }
 
-func (eds *EdsGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates model.XdsUpdates) model.Resources {
-	resp := []*any.Any{}
+var _ model.XdsResourceGenerator = &EdsGenerator{}
 
-	var edsUpdatedServices map[string]struct{} = nil
-	if updates != nil {
-		edsUpdatedServices = model.ConfigNamesOfKind(updates, gvk.ServiceEntry)
-	}
-	// All clusters that this endpoint is watching. For 1.0 - it's typically all clusters in the mesh.
-	// For 1.1+Sidecar - it's the small set of explicitly imported clusters, using the isolated DestinationRules
-	for _, clusterName := range w.ResourceNames {
-		_, _, hostname, _ := model.ParseSubsetKey(clusterName)
-		if _, f := edsUpdatedServices[string(hostname)]; f {
-			continue
-		}
-		epb := NewEndpointBuilder(clusterName, proxy, push)
-		l := eds.Server.generateEndpoints(epb)
-		if l == nil {
-			continue
-		}
-		msg := util.MessageToAny(l)
-		msg.TypeUrl = w.TypeUrl
-		resp = append(resp, msg)
-	}
-
-	return resp
+// Map of all configs that do not impact EDS
+var skippedEdsConfigs = map[config.GroupVersionKind]struct{}{
+	gvk.Gateway:               {},
+	gvk.VirtualService:        {},
+	gvk.WorkloadGroup:         {},
+	gvk.AuthorizationPolicy:   {},
+	gvk.RequestAuthentication: {},
+	gvk.Secret:                {},
 }
 
-// pushEds is pushing EDS updates for a single connection. Called the first time
-// a client connects, for incremental updates and for full periodic updates.
-func (s *DiscoveryServer) pushEds(push *model.PushContext, con *Connection, version string, edsUpdatedServices map[string]struct{}) error {
-	pushStart := time.Now()
-	loadAssignments := make([]*endpoint.ClusterLoadAssignment, 0)
-	endpoints := 0
+func edsNeedsPush(updates model.XdsUpdates) bool {
+	// If none set, we will always push
+	if len(updates) == 0 {
+		return true
+	}
+	for config := range updates {
+		if _, f := skippedEdsConfigs[config.Kind]; !f {
+			return true
+		}
+	}
+	return false
+}
+
+func (eds *EdsGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, req *model.PushRequest) model.Resources {
+	if !edsNeedsPush(req.ConfigsUpdated) {
+		return nil
+	}
+	var edsUpdatedServices map[string]struct{}
+	if !req.Full {
+		edsUpdatedServices = model.ConfigNamesOfKind(req.ConfigsUpdated, gvk.ServiceEntry)
+	}
+	resources := make([]*any.Any, 0)
 	empty := 0
 
-	// All clusters that this endpoint is watching. For 1.0 - it's typically all clusters in the mesh.
-	// For 1.1+Sidecar - it's the small set of explicitly imported clusters, using the isolated DestinationRules
-	for _, clusterName := range con.Clusters() {
+	cached := 0
+	regenerated := 0
+	for _, clusterName := range w.ResourceNames {
 		if edsUpdatedServices != nil {
 			_, _, hostname, _ := model.ParseSubsetKey(clusterName)
 			if _, ok := edsUpdatedServices[string(hostname)]; !ok {
@@ -351,39 +347,33 @@ func (s *DiscoveryServer) pushEds(push *model.PushContext, con *Connection, vers
 				continue
 			}
 		}
-		builder := NewEndpointBuilder(clusterName, con.proxy, push)
-		l := s.generateEndpoints(builder)
-		if l == nil {
-			continue
-		}
+		builder := NewEndpointBuilder(clusterName, proxy, push)
+		if marshalledEndpoint, f := eds.Server.Cache.Get(builder); f {
+			resources = append(resources, marshalledEndpoint)
+			cached++
+		} else {
+			l := eds.Server.generateEndpoints(builder)
+			if l == nil {
+				continue
+			}
+			regenerated++
 
-		for _, e := range l.Endpoints {
-			endpoints += len(e.LbEndpoints)
+			if len(l.Endpoints) == 0 {
+				empty++
+			}
+			resource := util.MessageToAny(l)
+			resources = append(resources, resource)
+			eds.Server.Cache.Add(builder, resource)
 		}
-
-		if len(l.Endpoints) == 0 {
-			empty++
-		}
-		loadAssignments = append(loadAssignments, l)
 	}
-
-	response := endpointDiscoveryResponse(loadAssignments, version, push.Version)
-	err := con.send(response)
-	edsPushTime.Record(time.Since(pushStart).Seconds())
-	if err != nil {
-		recordSendError("EDS", con.ConID, edsSendErrPushes, err)
-		return err
-	}
-	edsPushes.Increment()
-
-	if edsUpdatedServices == nil {
-		adsLog.Infof("EDS: PUSH for node:%s clusters:%d endpoints:%d empty:%v",
-			con.proxy.ID, len(con.Clusters()), endpoints, empty)
+	if len(edsUpdatedServices) == 0 {
+		adsLog.Infof("EDS: PUSH for node:%s resources:%d empty:%v cached:%v/%v",
+			proxy.ID, len(resources), empty, cached, cached+regenerated)
 	} else {
-		adsLog.Debugf("EDS: PUSH INC for node:%s clusters:%d endpoints:%d empty:%v",
-			con.proxy.ID, len(con.Clusters()), endpoints, empty)
+		adsLog.Debugf("EDS: PUSH INC for node:%s clusters:%d empty:%v cached:%v/%v",
+			proxy.ID, len(resources), empty, cached, cached+regenerated)
 	}
-	return nil
+	return resources
 }
 
 func getOutlierDetectionAndLoadBalancerSettings(
@@ -416,7 +406,7 @@ func getOutlierDetectionAndLoadBalancerSettings(
 	return outlierDetectionEnabled, lbSettings
 }
 
-func endpointDiscoveryResponse(loadAssignments []*endpoint.ClusterLoadAssignment, version, noncePrefix string) *discovery.DiscoveryResponse {
+func endpointDiscoveryResponse(loadAssignments []*any.Any, version, noncePrefix string) *discovery.DiscoveryResponse {
 	out := &discovery.DiscoveryResponse{
 		TypeUrl: v3.EndpointType,
 		// Pilot does not really care for versioning. It always supplies what's currently
@@ -425,9 +415,7 @@ func endpointDiscoveryResponse(loadAssignments []*endpoint.ClusterLoadAssignment
 		// will begin seeing results it deems to be good.
 		VersionInfo: version,
 		Nonce:       nonce(noncePrefix),
-	}
-	for _, loadAssignment := range loadAssignments {
-		out.Resources = append(out.Resources, util.MessageToAny(loadAssignment))
+		Resources:   loadAssignments,
 	}
 
 	return out

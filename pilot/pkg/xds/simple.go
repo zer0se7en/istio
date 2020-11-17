@@ -84,7 +84,7 @@ func NewXDS() *SimpleServer {
 	env.Watcher = mesh.NewFixedWatcher(&mc)
 	env.PushContext.Mesh = env.Watcher.Mesh()
 
-	ds := NewDiscoveryServer(env, nil)
+	ds := NewDiscoveryServer(env, nil, "pilot-123")
 	ds.CachesSynced()
 
 	// Config will have a fixed format:
@@ -149,13 +149,12 @@ func (s *SimpleServer) StartGRPC(addr string) error {
 	}
 	gs := grpc.NewServer()
 	s.DiscoveryServer.Register(gs)
-	s.DiscoveryServer.RegisterLegacyv2(gs)
 	reflection.Register(gs)
 	s.GRPCListener = lis
 	go func() {
 		err = gs.Serve(lis)
 		if err != nil {
-			log.Infoa("Serve done ", err)
+			log.Info("Serve done ", err)
 		}
 	}()
 	return nil
@@ -200,7 +199,7 @@ func (p *ProxyGen) Close() {
 // Responses will be forwarded back to the client.
 //
 // TODO: allow clients to indicate which requests they handle ( similar with topic )
-func (p *ProxyGen) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates model.XdsUpdates) model.Resources {
+func (p *ProxyGen) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, req *model.PushRequest) model.Resources {
 	if p.adsc == nil {
 		return nil
 	}
@@ -211,7 +210,7 @@ func (p *ProxyGen) Generate(proxy *model.Proxy, push *model.PushContext, w *mode
 	// Need to change the signature of Generator to take Request as parameter.
 	err := p.adsc.Send(w.LastRequest)
 	if err != nil {
-		log.Debuga("Failed to send, connection probably closed ", err)
+		log.Debug("Failed to send, connection probably closed ", err)
 	}
 
 	return nil

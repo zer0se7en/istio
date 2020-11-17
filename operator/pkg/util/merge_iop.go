@@ -41,17 +41,14 @@ type iopMergeStructType struct {
 }
 
 type istioOperatorSpec struct {
-	MeshConfig      *meshConfig            `json:"meshConfig" patchStrategy:"merge"`
-	Components      *istioComponentSetSpec `json:"components" patchStrategy:"merge"`
-	AddonComponents *externalComponentSpec `json:"addonComponents" patchStrategy:"merge"`
-	Values          *values                `json:"values" patchStrategy:"merge"`
+	MeshConfig *meshConfig            `json:"meshConfig" patchStrategy:"merge"`
+	Components *istioComponentSetSpec `json:"components" patchStrategy:"merge"`
+	Values     *values                `json:"values" patchStrategy:"merge"`
 }
 
 type istioComponentSetSpec struct {
 	Base            *baseComponentSpec `json:"base" patchStrategy:"merge"`
 	Pilot           *componentSpec     `json:"pilot" patchStrategy:"merge"`
-	Policy          *componentSpec     `json:"policy" patchStrategy:"merge"`
-	Telemetry       *componentSpec     `json:"telemetry" patchStrategy:"merge"`
 	Cni             *componentSpec     `json:"cni" patchStrategy:"merge"`
 	IstiodRemote    *componentSpec     `json:"istiodRemote" patchStrategy:"merge"`
 	IngressGateways []*gatewaySpec     `json:"ingressGateways" patchStrategy:"merge" patchMergeKey:"name"`
@@ -70,13 +67,8 @@ type gatewaySpec struct {
 	K8S *v1alpha1.KubernetesResourcesSpec `json:"k8s" patchStrategy:"merge"`
 }
 
-type externalComponentSpec struct {
-	IstioCoreDNS *componentSpec `json:"istiocoredns" patchStrategy:"merge"`
-}
-
 type values struct {
 	Cni                    *v1alpha12.CNIConfig             `json:"cni" patchStrategy:"merge"`
-	Istiocoredns           *v1alpha12.CoreDNSConfig         `json:"istiocoredns" patchStrategy:"merge"`
 	Gateways               *gatewaysConfig                  `json:"gateways" patchStrategy:"merge"`
 	Global                 *v1alpha12.GlobalConfig          `json:"global" patchStrategy:"merge"`
 	Pilot                  *v1alpha12.PilotConfig           `json:"pilot" patchStrategy:"merge"`

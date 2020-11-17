@@ -52,7 +52,7 @@ var (
 	).Get()
 
 	// FilterGatewayClusterConfig controls if a subset of clusters(only those required) should be pushed to gateways
-	FilterGatewayClusterConfig = env.RegisterBoolVar("PILOT_FILTER_GATEWAY_CLUSTER_CONFIG", false, "").Get()
+	FilterGatewayClusterConfig = env.RegisterBoolVar("PILOT_FILTER_GATEWAY_CLUSTER_CONFIG", true, "").Get()
 
 	DebounceAfter = env.RegisterDurationVar(
 		"PILOT_DEBOUNCE_AFTER",
@@ -174,11 +174,12 @@ var (
 			"Gateways with same selectors in different namespaces will not be applicable.",
 	).Get()
 
-	InboundProtocolDetectionTimeout = env.RegisterDurationVar(
+	// nolint
+	InboundProtocolDetectionTimeout, InboundProtocolDetectionTimeoutSet = env.RegisterDurationVar(
 		"PILOT_INBOUND_PROTOCOL_DETECTION_TIMEOUT",
 		1*time.Second,
 		"Protocol detection timeout for inbound listener",
-	).Get()
+	).Lookup()
 
 	EnableHeadlessService = env.RegisterBoolVar(
 		"PILOT_ENABLE_HEADLESS_SERVICE_POD_LISTENERS",
@@ -215,6 +216,13 @@ var (
 		"If enabled, Pilot will use EndpointSlices as the source of endpoints for Kubernetes services. "+
 			"By default, this is false, and Endpoints will be used. This requires the Kubernetes EndpointSlice controller to be enabled. "+
 			"Currently this is mutual exclusive - either Endpoints or EndpointSlices will be used",
+	).Get()
+
+	EnableSDSServer = env.RegisterBoolVar(
+		"ISTIOD_ENABLE_SDS_SERVER",
+		true,
+		"If enabled, Istiod will serve SDS for credentialName secrets (rather than in-proxy). "+
+			"To ensure proper security, PILOT_ENABLE_XDS_IDENTITY_CHECK=true is required as well.",
 	).Get()
 
 	EnableCRDValidation = env.RegisterBoolVar(
@@ -258,7 +266,7 @@ var (
 		"Custom host name of istiod that istiod signs the server cert.")
 
 	PilotCertProvider = env.RegisterStringVar("PILOT_CERT_PROVIDER", "istiod",
-		"the provider of Pilot DNS certificate.")
+		"The provider of Pilot DNS certificate.")
 
 	JwtPolicy = env.RegisterStringVar("JWT_POLICY", jwt.PolicyThirdParty,
 		"The JWT validation policy.")
@@ -281,29 +289,35 @@ var (
 
 	EnableVirtualServiceDelegate = env.RegisterBoolVar(
 		"PILOT_ENABLE_VIRTUAL_SERVICE_DELEGATE",
-		false,
-		"If enabled, Pilot will merge virtual services with delegates. "+
-			"By default, this is false, and virtualService with delegate will be ignored",
-	).Get()
+		true,
+		"If set to false, virtualService delegate will not be supported.").Get()
 
 	ClusterName = env.RegisterStringVar("CLUSTER_ID", "Kubernetes",
 		"Defines the cluster and service registry that this Istiod instance is belongs to").Get()
 
-	EnableIncrementalMCP = env.RegisterBoolVar(
-		"PILOT_ENABLE_INCREMENTAL_MCP",
-		false,
-		"If enabled, pilot will set the incremental flag of the options in the mcp controller "+
-			"to true, and then galley may push data incrementally, it depends on whether the "+
-			"resource supports incremental. By default, this is false.").Get()
-
+	// CentralIstioD will be Deprecated: TODO remove in 1.9 in favor of `ExternalIstioD`
 	CentralIstioD = env.RegisterBoolVar("CENTRAL_ISTIOD", false,
+		"If this is set to true, one Istiod will control remote clusters including CA.").Get()
+	ExternalIstioD = env.RegisterBoolVar("EXTERNAL_ISTIOD", false,
 		"If this is set to true, one Istiod will control remote clusters including CA.").Get()
 
 	EnableCAServer = env.RegisterBoolVar("ENABLE_CA_SERVER", true,
 		"If this is set to false, will not create CA server in istiod.").Get()
 
+	EnableDebugOnHTTP = env.RegisterBoolVar("ENABLE_DEBUG_ON_HTTP", true,
+		"If this is set to false, the debug interface will not be ebabled on Http, recommended for production").Get()
+
+	EnableAdminEndpoints = env.RegisterBoolVar("ENABLE_ADMIN_ENDPOINTS", false,
+		"If this is set to true, dangerous admin endpoins will be exposed on the debug interface. Not recommended for production.").Get()
+
 	XDSAuth = env.RegisterBoolVar("XDS_AUTH", true,
 		"If true, will authenticate XDS clients.").Get()
+
+	EnableXDSIdentityCheck = env.RegisterBoolVar(
+		"PILOT_ENABLE_XDS_IDENTITY_CHECK",
+		true,
+		"If enabled, pilot will authorize XDS clients, to ensure they are acting only as namespaces they have permissions for.",
+	).Get()
 
 	EnableServiceEntrySelectPods = env.RegisterBoolVar("PILOT_ENABLE_SERVICEENTRY_SELECT_PODS", true,
 		"If enabled, service entries with selectors will select pods from the cluster. "+
@@ -322,4 +336,66 @@ var (
 			"No need to configure this for root certificates issued via Istiod or web-PKI based root certificates. "+
 			"Use || between <trustdomain, endpoint> tuples. Use | as delimiter between trust domain and endpoint in "+
 			"each tuple. For example: foo|https://url/for/foo||bar|https://url/for/bar").Get()
+
+	EnableXDSCaching = env.RegisterBoolVar("PILOT_ENABLE_XDS_CACHE", true,
+		"If true, Pilot will cache XDS responses.").Get()
+
+	EnableXDSCacheMetrics = env.RegisterBoolVar("PILOT_XDS_CACHE_STATS", false,
+		"If true, Pilot will collect metrics for XDS cache efficiency.").Get()
+
+	XDSCacheMaxSize = env.RegisterIntVar("PILOT_XDS_CACHE_SIZE", 20000,
+		"The maximum number of cache entries for the XDS cache. If the size is <= 0, the cache will have no upper bound.").Get()
+
+	AllowMetadataCertsInMutualTLS = env.RegisterBoolVar("PILOT_ALLOW_METADATA_CERTS_DR_MUTUAL_TLS", false,
+		"If true, Pilot will allow certs specified in Metadata to override DR certs in MUTUAL TLS mode. "+
+			"This is only enabled for migration and will be removed soon.").Get()
+
+	// EnableLegacyFSGroupInjection has first-party-jwt as allowed because we only
+	// need the fsGroup configuration for the projected service account volume mount,
+	// which is only used by first-party-jwt. The installer will automatically
+	// configure this on Kubernetes 1.19+.
+	EnableLegacyFSGroupInjection = env.RegisterBoolVar("ENABLE_LEGACY_FSGROUP_INJECTION", JwtPolicy.Get() != jwt.PolicyFirstParty,
+		"If true, Istiod will set the pod fsGroup to 1337 on injection. This is required for Kubernetes 1.18 and older "+
+			`(see https://github.com/kubernetes/kubernetes/issues/57923 for details) unless JWT_POLICY is "first-party-jwt".`).Get()
+
+	EnableTLSv2OnInboundPath = env.RegisterBoolVar("PILOT_SIDECAR_ENABLE_INBOUND_TLS_V2", true,
+		"If true, Pilot will set the TLS version on server side as TLSv1_2 and also enforce strong cipher suites").Get()
+
+	XdsPushSendTimeout = env.RegisterDurationVar(
+		"PILOT_XDS_SEND_TIMEOUT",
+		5*time.Second,
+		"The timeout to send the XDS configuration to proxies. After this timeout is reached, Pilot will discard that push.",
+	).Get()
+
+	EndpointTelemetryLabel = env.RegisterBoolVar("PILOT_ENDPOINT_TELEMETRY_LABEL", true,
+		"If true, pilot will add telemetry related metadata to Endpoint resource, which will be consumed by telemetry filter.",
+	).Get()
+
+	WorkloadEntryAutoRegistration = env.RegisterBoolVar("PILOT_ENABLE_WORKLOAD_ENTRY_AUTOREGISTRATION", false,
+		"Enables auto-registering WorkloadEntries based on associated WorkloadGroups upon XDS connection by the workload.").Get()
+
+	WorkloadEntryCleanupGracePeriod = env.RegisterDurationVar("PILOT_WORKLOAD_ENTRY_GRACE_PERIOD", 10*time.Second,
+		"The amount of time an auto-registered workload can remain disconnected from all Pilot instances before the "+
+			"associated WorkloadEntry is cleaned up.").Get()
+
+	WorkloadEntryHealthChecks = env.RegisterBoolVar("PILOT_ENABLE_WORKLOAD_ENTRY_HEALTHCHECKS", false,
+		"Enables automatic health checks of WorkloadEntries based on the config provided in the associated WorkloadGroup").Get()
+
+	EnableFlowControl = env.RegisterBoolVar(
+		"PILOT_ENABLE_FLOW_CONTROL",
+		false,
+		"If enabled, pilot will wait for the completion of a receive operation before"+
+			"executing a push operation. This is a form of flow control and is useful in"+
+			"environments with high rates of push requests to each gateway. By default,"+
+			"this is false.").Get()
+
+	FlowControlTimeout = env.RegisterDurationVar(
+		"PILOT_FLOW_CONTROL_TIMEOUT",
+		15*time.Second,
+		"If set, the max amount of time to delay a push by. Depends on PILOT_ENABLE_FLOW_CONTROL.",
+	).Get()
+
+	PilotEnableLoopBlockers = env.RegisterBoolVar("PILOT_ENABLE_LOOP_BLOCKER", true,
+		"If enabled, Envoy will be configured to prevent traffic directly the the inbound/outbound "+
+			"ports (15001/15006). This prevents traffic loops. This option will be removed, and considered always enabled, in 1.9.").Get()
 )

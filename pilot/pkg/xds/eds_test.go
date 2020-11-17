@@ -34,6 +34,7 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/adsc"
@@ -54,6 +55,67 @@ const (
 	edsIncSvc = "eds.test.svc.cluster.local"
 	edsIncVip = "10.10.1.2"
 )
+
+func TestIncrementalPush(t *testing.T) {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{ConfigString: mustReadFile(t, "tests/testdata/config/destination-rule-all.yaml")})
+	ads := s.Connect(nil, nil, watchAll)
+	t.Run("Full Push", func(t *testing.T) {
+		s.Discovery.Push(&model.PushRequest{Full: true})
+		if _, err := ads.Wait(time.Second*5, watchAll...); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Incremental Push", func(t *testing.T) {
+		ads.WaitClear()
+		s.Discovery.Push(&model.PushRequest{Full: false})
+		if err := ads.WaitSingle(time.Second*5, v3.EndpointType, v3.ClusterType); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Incremental Push with updated services", func(t *testing.T) {
+		ads.WaitClear()
+		s.Discovery.Push(&model.PushRequest{
+			Full: false,
+			ConfigsUpdated: map[model.ConfigKey]struct{}{
+				{Name: "destall.default.svc.cluster.local", Namespace: "testns", Kind: gvk.ServiceEntry}: {},
+			},
+		})
+		if err := ads.WaitSingle(time.Second*5, v3.EndpointType, v3.ClusterType); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Full Push with updated services", func(t *testing.T) {
+		ads.WaitClear()
+		s.Discovery.Push(&model.PushRequest{
+			Full: true,
+			ConfigsUpdated: map[model.ConfigKey]struct{}{
+				{Name: "foo.bar", Namespace: "default", Kind: gvk.ServiceEntry}:   {},
+				{Name: "destall", Namespace: "testns", Kind: gvk.DestinationRule}: {},
+			},
+		})
+		if _, err := ads.Wait(time.Second*5, watchAll...); err != nil {
+			t.Fatal(err)
+		}
+		if len(ads.GetEndpoints()) < 3 {
+			t.Fatalf("Expected a full EDS update, but got: %v", ads.GetEndpoints())
+		}
+	})
+	t.Run("Full Push without updated services", func(t *testing.T) {
+		ads.WaitClear()
+		s.Discovery.Push(&model.PushRequest{
+			Full: true,
+			ConfigsUpdated: map[model.ConfigKey]struct{}{
+				{Name: "destall", Namespace: "testns", Kind: gvk.DestinationRule}: {},
+			},
+		})
+		if _, err := ads.Wait(time.Second*5, v3.ClusterType, v3.EndpointType); err != nil {
+			t.Fatal(err)
+		}
+		if len(ads.GetEndpoints()) < 3 {
+			t.Fatalf("Expected a full EDS update, but got: %v", ads.GetEndpoints())
+		}
+	})
+}
 
 func TestEds(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{ConfigString: mustReadFile(t, "tests/testdata/config/destination-rule-locality.yaml")})
@@ -106,14 +168,88 @@ func TestEds(t *testing.T) {
 		}
 		strResponse, _ := json.MarshalIndent(clusters, " ", " ")
 		_ = ioutil.WriteFile(env.IstioOut+"/cdsv2_sidecar.json", strResponse, 0644)
+	})
+}
 
+func TestTunnelServerEndpointEds(t *testing.T) {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	s.Discovery.MemRegistry.AddHTTPService(edsIncSvc, edsIncVip, 8080)
+	s.Discovery.MemRegistry.SetEndpoints(edsIncSvc, "",
+		[]*model.IstioEndpoint{
+			{
+				Address:         "127.0.0.1",
+				ServicePortName: "http-main",
+				EndpointPort:    80,
+				//Labels:          map[string]string{"version": version},
+				ServiceAccount: "hello-sa",
+				TunnelAbility:  networking.MakeTunnelAbility(networking.H2Tunnel),
+			},
+		})
+
+	t.Run("TestClientWantsTunnelEndpoints", func(t *testing.T) {
+		t.Helper()
+		adscConn1 := s.Connect(&model.Proxy{IPAddresses: []string{"10.10.10.10"}, Metadata: &model.NodeMetadata{
+			ProxyConfig: &model.NodeMetaProxyConfig{
+				ProxyMetadata: map[string]string{
+					"tunnel": networking.H2TunnelTypeName,
+				},
+			},
+		}}, nil, watchAll)
+		testTunnelEndpoints("127.0.0.1", 15009, adscConn1, t)
+	})
+	t.Run("TestClientWantsNoTunnelEndpoints", func(t *testing.T) {
+		t.Helper()
+		adscConn2 := s.Connect(&model.Proxy{IPAddresses: []string{"10.10.10.11"}, Metadata: &model.NodeMetadata{
+			ProxyConfig: &model.NodeMetaProxyConfig{},
+		}}, nil, watchAll)
+		testTunnelEndpoints("127.0.0.1", 80, adscConn2, t)
+	})
+}
+
+func TestNoTunnelServerEndpointEds(t *testing.T) {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+
+	// Add the test ads clients to list of service instances in order to test the context dependent locality coloring.
+	addTestClientEndpoints(s)
+
+	s.Discovery.MemRegistry.AddHTTPService(edsIncSvc, edsIncVip, 8080)
+	s.Discovery.MemRegistry.SetEndpoints(edsIncSvc, "",
+		[]*model.IstioEndpoint{
+			{
+				Address:         "127.0.0.1",
+				ServicePortName: "http-main",
+				EndpointPort:    80,
+				//Labels:          map[string]string{"version": version},
+				ServiceAccount: "hello-sa",
+				// No Tunnel Support at this endpoint.
+				TunnelAbility: networking.MakeTunnelAbility(),
+			},
+		})
+
+	t.Run("TestClientWantsTunnelEndpoints", func(t *testing.T) {
+		adscConn := s.Connect(&model.Proxy{IPAddresses: []string{"10.10.10.10"}, Metadata: &model.NodeMetadata{
+			ProxyConfig: &model.NodeMetaProxyConfig{
+				ProxyMetadata: map[string]string{
+					"tunnel": networking.H2TunnelTypeName,
+				},
+			},
+		}}, nil, watchAll)
+		testTunnelEndpoints("127.0.0.1", 80, adscConn, t)
+	})
+
+	t.Run("TestClientWantsNoTunnelEndpoints", func(t *testing.T) {
+		adscConn := s.Connect(&model.Proxy{IPAddresses: []string{"10.10.10.11"}, Metadata: &model.NodeMetadata{}}, nil, watchAll)
+		testTunnelEndpoints("127.0.0.1", 80, adscConn, t)
 	})
 }
 
 func mustReadFile(t *testing.T, fpaths ...string) string {
 	result := ""
 	for _, fpath := range fpaths {
-		bytes, err := ioutil.ReadFile(filepath.Join(env.IstioSrc, fpath))
+		if !strings.HasPrefix(fpath, ".") {
+			fpath = filepath.Join(env.IstioSrc, fpath)
+		}
+		bytes, err := ioutil.ReadFile(fpath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,12 +260,16 @@ func mustReadFile(t *testing.T, fpaths ...string) string {
 }
 func mustReadfolder(t *testing.T, folder string) string {
 	result := ""
-	f, err := ioutil.ReadDir(filepath.Join(env.IstioSrc, folder))
+	fpathRoot := folder
+	if !strings.HasPrefix(fpathRoot, ".") {
+		fpathRoot = filepath.Join(env.IstioSrc, folder)
+	}
+	f, err := ioutil.ReadDir(fpathRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, fpath := range f {
-		bytes, err := ioutil.ReadFile(filepath.Join(env.IstioSrc, folder, fpath.Name()))
+		bytes, err := ioutil.ReadFile(filepath.Join(fpathRoot, fpath.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,7 +331,7 @@ func TestEDSServiceResolutionUpdate(t *testing.T) {
 	// Now update the service resolution to DNSLB with a DNS endpoint.
 	updateServiceResolution(s)
 
-	if _, err := adscConn.Wait(5*time.Second, "eds"); err != nil {
+	if _, err := adscConn.Wait(5*time.Second, v3.EndpointType); err != nil {
 		t.Fatal(err)
 	}
 
@@ -215,13 +355,13 @@ func TestEndpointFlipFlops(t *testing.T) {
 	// Clear the endpoint and validate it does not trigger a full push.
 	s.Discovery.MemRegistry.SetEndpoints("flipflop.com", "", []*model.IstioEndpoint{})
 
-	upd, _ := adscConn.Wait(5*time.Second, "eds")
+	upd, _ := adscConn.Wait(5*time.Second, v3.EndpointType)
 
 	if contains(upd, "cds") {
 		t.Fatalf("Expecting only EDS update as part of a partial push. But received CDS also %v", upd)
 	}
 
-	if len(upd) > 0 && !contains(upd, "eds") {
+	if len(upd) > 0 && !contains(upd, v3.EndpointType) {
 		t.Fatalf("Expecting EDS push as part of a partial push. But received %v", upd)
 	}
 
@@ -250,7 +390,7 @@ func TestEndpointFlipFlops(t *testing.T) {
 		t.Fatal("Expecting only EDS update as part of a partial push. But received CDS also +v", upd)
 	}
 
-	if len(upd) > 0 && !contains(upd, "eds") {
+	if len(upd) > 0 && !contains(upd, v3.EndpointType) {
 		t.Fatal("Expecting EDS push as part of a partial push. But did not receive +v", upd)
 	}
 
@@ -279,15 +419,16 @@ func fullPush(s *xds.FakeDiscoveryServer) {
 	s.Discovery.Push(&model.PushRequest{Full: true})
 }
 
-func adsConnectAndWait(t *testing.T, ip int) *adsc.ADSC {
-	adscConn, err := adsc.Dial(util.MockPilotGrpcAddr, "", &adsc.Config{
-		IP: testIP(uint32(ip)),
-	})
+func adsConnectAndWait(t *testing.T) *adsc.ADSC {
+	adscConn, err := adsc.New(util.MockPilotGrpcAddr, &adsc.Config{})
 	if err != nil {
 		t.Fatal("Error connecting ", err)
 	}
+	if err := adscConn.Run(); err != nil {
+		t.Fatal("ADSC: failed running ", err)
+	}
 	adscConn.Watch()
-	_, err = adscConn.Wait(10*time.Second, "eds", "lds", "cds", "rds")
+	_, err = adscConn.Wait(10*time.Second, watchAll...)
 	if err != nil {
 		t.Fatal("Error getting initial config ", err)
 	}
@@ -363,6 +504,31 @@ func testEndpoints(expected string, cluster string, adsc *adsc.ADSC, t *testing.
 		}
 	}
 	t.Fatalf("Expecting %s got %v", expected, found)
+}
+
+// Verify server sends the tunneled endpoints.
+// nolint: unparam
+func testTunnelEndpoints(expectIP string, expectPort uint32, adsc *adsc.ADSC, t *testing.T) {
+	t.Helper()
+	cluster := "outbound|8080||eds.test.svc.cluster.local"
+	allClusters := adsc.GetEndpoints()
+	cla, f := allClusters[cluster]
+	if !f || len(cla.Endpoints) == 0 {
+		t.Fatalf("No lb endpoints for %v, %v", cluster, adsc.EndpointsJSON())
+	}
+	var found []string
+	for _, lbe := range cla.Endpoints {
+		for _, e := range lbe.LbEndpoints {
+			addr := e.GetEndpoint().Address.GetSocketAddress().Address
+			port := e.GetEndpoint().Address.GetSocketAddress().GetPortValue()
+			found = append(found, fmt.Sprintf("%s:%d", addr, port))
+			if expectIP == addr && expectPort == port {
+				return
+			}
+		}
+	}
+	t.Errorf("REACH HERE cannot find %s:%d", expectIP, expectPort)
+	t.Fatalf("Expecting address %s:%d got %v", expectIP, expectPort, found)
 }
 
 func testLocalityPrioritizedEndpoints(adsc *adsc.ADSC, adsc2 *adsc.ADSC, t *testing.T) {
@@ -460,7 +626,7 @@ func edsUpdates(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 
 	// will trigger recompute and push
 
-	if _, err := adsc.Wait(5*time.Second, "eds"); err != nil {
+	if _, err := adsc.Wait(5*time.Second, v3.EndpointType); err != nil {
 		t.Fatal("EDS push failed", err)
 	}
 	testTCPEndpoints("127.0.0.3", adsc, t)
@@ -469,7 +635,7 @@ func edsUpdates(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 // edsFullUpdateCheck checks for updates required in a full push after the CDS update
 func edsFullUpdateCheck(adsc *adsc.ADSC, t *testing.T) {
 	t.Helper()
-	if upd, err := adsc.Wait(15*time.Second, "cds", "eds", "lds", "rds"); err != nil {
+	if upd, err := adsc.Wait(15*time.Second, watchAll...); err != nil {
 		t.Fatal("Expecting CDS, EDS, LDS, and RDS update as part of a full push", err, upd)
 	}
 }
@@ -498,7 +664,7 @@ func edsUpdateInc(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 	if err != nil {
 		t.Fatal("Incremental push failed", err)
 	}
-	if !reflect.DeepEqual(upd, []string{"eds"}) {
+	if !reflect.DeepEqual(upd, []string{v3.EndpointType}) {
 		t.Fatal("Expecting EDS only update, got", upd)
 	}
 
@@ -519,7 +685,7 @@ func edsUpdateInc(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 	if err != nil {
 		t.Fatal("Incremental push failed", err)
 	}
-	if !reflect.DeepEqual(upd, []string{"eds"}) {
+	if !reflect.DeepEqual(upd, []string{v3.EndpointType}) {
 		t.Fatal("Expecting EDS only update, got", upd)
 	}
 	testTCPEndpoints("127.0.0.4", adsc, t)
@@ -538,7 +704,7 @@ func edsUpdateInc(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 	if err != nil {
 		t.Fatal("Incremental push failed", err)
 	}
-	if !reflect.DeepEqual(upd, []string{"eds"}) {
+	if !reflect.DeepEqual(upd, []string{v3.EndpointType}) {
 		t.Fatal("Expecting EDS only update, got", upd)
 	}
 	testTCPEndpoints("127.0.0.5", adsc, t)
@@ -546,7 +712,7 @@ func edsUpdateInc(s *xds.FakeDiscoveryServer, adsc *adsc.ADSC, t *testing.T) {
 	// Wipe out all endpoints - expect full
 	s.Discovery.MemRegistry.SetEndpoints(edsIncSvc, "", []*model.IstioEndpoint{})
 
-	if upd, err := adsc.Wait(15*time.Second, "eds"); err != nil {
+	if upd, err := adsc.Wait(15*time.Second, v3.EndpointType); err != nil {
 		t.Fatal("Expecting EDS update as part of a partial push", err, upd)
 	}
 
@@ -569,10 +735,7 @@ func multipleRequest(s *xds.FakeDiscoveryServer, inc bool, nclients,
 	// be detected
 	// This is not using adsc, which consumes the events automatically.
 	ads := s.ConnectADS()
-	err := sendCDSReq(sidecarID(testIP(0x0a120001), "app3"), ads)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ads.Request(nil)
 
 	n := nclients
 	wg.Add(n)
@@ -585,7 +748,7 @@ func multipleRequest(s *xds.FakeDiscoveryServer, inc bool, nclients,
 			defer wg.Done()
 			// Connect and get initial response
 			adscConn := s.Connect(&model.Proxy{IPAddresses: []string{fmt.Sprintf("1.1.1.%d", id)}}, nil, nil)
-			_, err := adscConn.Wait(15*time.Second, "rds")
+			_, err := adscConn.Wait(15*time.Second, v3.RouteType)
 			if err != nil {
 				errChan <- errors.New("failed to get initial rds: " + err.Error())
 				wgConnect.Done()
@@ -604,7 +767,7 @@ func multipleRequest(s *xds.FakeDiscoveryServer, inc bool, nclients,
 			log.Println("Waiting for pushes ", id)
 
 			// Pushes may be merged so we may not get nPushes pushes
-			got, err := adscConn.Wait(15*time.Second, "eds")
+			got, err := adscConn.Wait(15*time.Second, v3.EndpointType)
 
 			// If in incremental mode, shouldn't receive cds|rds|lds here
 			if inc {

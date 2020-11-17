@@ -34,10 +34,10 @@ import (
 	pilotmodel "istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/mcp/status"
 	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/nodeagent/secretfetcher"
 	nodeagentutil "istio.io/istio/security/pkg/nodeagent/util"
 	pkiutil "istio.io/istio/security/pkg/pki/util"
-	"istio.io/istio/security/pkg/util"
 	"istio.io/pkg/filewatcher"
 	"istio.io/pkg/log"
 )
@@ -233,11 +233,10 @@ func (sc *SecretCache) GenerateSecret(ctx context.Context, connectionID, resourc
 			return nil, err
 		}
 
-		cacheLog.Infoa("GenerateSecret ", resourceName)
+		cacheLog.Info("GenerateSecret ", resourceName)
 		sc.secrets.Store(connKey, *ns)
 		return ns, nil
 	}
-
 	// If request is for root certificate,
 	// retry since rootCert may be empty until there is CSR response returned from CA.
 	rootCert, rootCertExpr := sc.getRootCert()
@@ -269,7 +268,7 @@ func (sc *SecretCache) GenerateSecret(ctx context.Context, connectionID, resourc
 		CreatedTime:  t,
 		Version:      t.String(),
 	}
-	cacheLog.Infoa("Loaded root cert from certificate ", resourceName)
+	cacheLog.Info("Loaded root cert from certificate ", resourceName)
 	sc.secrets.Store(connKey, *ns)
 	cacheLog.Debugf("%s successfully generate secret for proxy", logPrefix)
 	return ns, nil
@@ -352,7 +351,7 @@ func (sc *SecretCache) SecretExist(connectionID, resourceName, token, version st
 func (sc *SecretCache) ShouldWaitForGatewaySecret(connectionID, resourceName, token string, fileMountedCertsOnly bool) bool {
 	// If node agent works as workload agent, node agent does not expect any gateway secret.
 	// If workload is using file mounted certs, we should not wait for ingress secret.
-	if sc.fetcher.UseCaClient || fileMountedCertsOnly {
+	if sc.fetcher.CaClient != nil || fileMountedCertsOnly {
 		return false
 	}
 
@@ -520,7 +519,7 @@ func (sc *SecretCache) UpdateK8sSecret(secretName string, ns security.SecretItem
 
 func (sc *SecretCache) rotate(updateRootFlag bool) {
 	// Skip secret rotation for kubernetes secrets.
-	if !sc.fetcher.UseCaClient {
+	if sc.fetcher.CaClient == nil {
 		return
 	}
 
@@ -570,6 +569,14 @@ func (sc *SecretCache) rotate(updateRootFlag bool) {
 			return true
 		}
 
+		// TODO: REMOVE THE SIDE-EFFECTS AND CLEANUP
+		// The rotate() code has the side-effect of calling CredFetcher - which in turn has the side-effect of creating
+		// a file with the token, used by Envoy for VMs. So we must continue to call
+		// CredFetcher in this loop, and we can't change the code to run rotate() only when we know the token is about
+		// to expire (which is easy to determine from the token content or the request).
+		// This must be called even if certs are used for refresh/provisioning - or even if mtls is disabled for this
+		// workload, since the side-effect JWT is used in unrelated STS flow used by Envoy. Do not remove until that
+		// code is fixed.
 		if sc.configOptions.CredFetcher != nil {
 			// Refresh token through credential fetcher.
 			cacheLog.Debugf("%s getting a new token through credential fetcher", logPrefix)
@@ -584,19 +591,22 @@ func (sc *SecretCache) rotate(updateRootFlag bool) {
 		// Re-generate secret if it's expired.
 		if sc.shouldRotate(&secret) {
 			atomic.AddUint64(&sc.secretChangedCount, 1)
-			// Send the notification to close the stream if token is expired, so that client could re-connect with a new token.
-			if sc.isTokenExpired(&secret) && !sc.useCertToRotate() {
-				cacheLog.Debugf("%s token expired", logPrefix)
-				// TODO(myidpt): Optimization needed. When using local JWT, server should directly push the new secret instead of
-				// requiring the client to send another SDS request.
-				sc.callbackWithTimeout(connKey, nil /*nil indicates close the streaming connection to proxy*/)
-				return true
-			}
 
+			// TODO: not clear why a wg is used, and then a wait - instead of just running the code. Cleanup ?
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				cacheLog.Debugf("%s use token to generate key/cert", logPrefix)
+				if !sc.useCertToRotate() {
+					if sc.configOptions.CredFetcher == nil {
+						tok, err := ioutil.ReadFile(sc.configOptions.JWTPath)
+						if err != nil {
+							cacheLog.Errorf("failed to get credential token: %v", err)
+						} else {
+							secret.Token = string(tok)
+						}
+					}
+				}
 
 				// If token is still valid, re-generated the secret and push change to proxy.
 				// Most likely this code path may not necessary, since TTL of cert is much longer than token.
@@ -688,7 +698,7 @@ func (sc *SecretCache) keyCertificateExist(certPath, keyPath string) bool {
 }
 
 // Generate a root certificate item from the passed in rootCertPath
-func (sc *SecretCache) generateRootCertFromExistingFile(rootCertPath, token string, connKey ConnKey) (*security.SecretItem, error) {
+func (sc *SecretCache) generateRootCertFromExistingFile(rootCertPath, token string, connKey ConnKey, workload bool) (*security.SecretItem, error) {
 	rootCert, err := readFileWithTimeout(rootCertPath)
 	if err != nil {
 		return nil, err
@@ -701,8 +711,10 @@ func (sc *SecretCache) generateRootCertFromExistingFile(rootCertPath, token stri
 		return nil, fmt.Errorf("failed to extract expiration time in the root certificate loaded from file: %v", err)
 	}
 
-	// Set the rootCert
-	sc.setRootCert(rootCert, certExpireTime)
+	// Set the rootCert only if it is workload root cert.
+	if workload {
+		sc.setRootCert(rootCert, certExpireTime)
+	}
 	return &security.SecretItem{
 		ResourceName: connKey.ResourceName,
 		RootCert:     rootCert,
@@ -774,7 +786,7 @@ func (sc *SecretCache) generateFileSecret(connKey ConnKey, token string) (bool, 
 	// Default root certificate.
 	case connKey.ResourceName == RootCertReqResourceName && sc.rootCertificateExist(sc.existingRootCertFile):
 		sdsFromFile = true
-		if sitem, err = sc.generateRootCertFromExistingFile(sc.existingRootCertFile, token, connKey); err == nil {
+		if sitem, err = sc.generateRootCertFromExistingFile(sc.existingRootCertFile, token, connKey, true); err == nil {
 			sc.addFileWatcher(sc.existingRootCertFile, token, connKey)
 		}
 	// Default workload certificate.
@@ -792,7 +804,7 @@ func (sc *SecretCache) generateFileSecret(connKey ConnKey, token string) (bool, 
 		sdsFromFile = ok
 		switch {
 		case ok && cfg.IsRootCertificate():
-			if sitem, err = sc.generateRootCertFromExistingFile(cfg.CaCertificatePath, token, connKey); err == nil {
+			if sitem, err = sc.generateRootCertFromExistingFile(cfg.CaCertificatePath, token, connKey, false); err == nil {
 				sc.addFileWatcher(cfg.CaCertificatePath, token, connKey)
 			}
 		case ok && cfg.IsKeyCertificate():
@@ -809,7 +821,7 @@ func (sc *SecretCache) generateFileSecret(connKey ConnKey, token string) (bool, 
 				logPrefix, err)
 			return sdsFromFile, nil, err
 		}
-		cacheLog.Infoa("GenerateSecret from file ", resourceName)
+		cacheLog.Info("GenerateSecret from file ", resourceName)
 		sc.secrets.Store(connKey, *sitem)
 		return sdsFromFile, sitem, nil
 	}
@@ -819,7 +831,7 @@ func (sc *SecretCache) generateFileSecret(connKey ConnKey, token string) (bool, 
 func (sc *SecretCache) generateSecret(ctx context.Context, token string, connKey ConnKey, t time.Time) (*security.SecretItem, error) {
 	// If node agent works as gateway agent, searches for kubernetes secret instead of sending
 	// CSR to CA.
-	if !sc.fetcher.UseCaClient {
+	if sc.fetcher.CaClient == nil {
 		return sc.generateGatewaySecret(token, connKey, t)
 	}
 
@@ -834,8 +846,15 @@ func (sc *SecretCache) generateSecret(ctx context.Context, token string, connKey
 		numFailedOutgoingRequests.With(RequestType.Value(TokenExchange)).Increment()
 		return nil, err
 	}
+	csrHostName := &spiffe.Identity{
+		TrustDomain:    sc.configOptions.TrustDomain,
+		Namespace:      sc.configOptions.WorkloadNamespace,
+		ServiceAccount: sc.configOptions.ServiceAccount,
+	}
 
+	cacheLog.Debugf("constructed host name for CSR: %s", csrHostName.String())
 	options := pkiutil.CertOptions{
+		Host:       csrHostName.String(),
 		RSAKeySize: keySize,
 		PKCS8Key:   sc.configOptions.Pkcs8Keys,
 		ECSigAlg:   pkiutil.SupportedECSignatureAlgorithms(sc.configOptions.ECCSigAlg),
@@ -861,10 +880,7 @@ func (sc *SecretCache) generateSecret(ctx context.Context, token string, connKey
 	cacheLog.Debugf("%s received CSR response with certificate chain %+v \n",
 		logPrefix, certChainPEM)
 
-	certChain := []byte{}
-	for _, c := range certChainPEM {
-		certChain = append(certChain, []byte(c)...)
-	}
+	certChain := concatCerts(certChainPEM)
 
 	var expireTime time.Time
 	// Cert expire time by default is createTime + sc.configOptions.SecretTTL.
@@ -914,22 +930,6 @@ func (sc *SecretCache) shouldRotate(secret *security.SecretItem) bool {
 	cacheLog.Debugf("Secret %s: lifetime: %v, graceperiod: %v, expiration: %v, should rotate: %v",
 		secret.ResourceName, secretLifeTime, gracePeriod, secret.ExpireTime, rotate)
 	return rotate
-}
-
-func (sc *SecretCache) isTokenExpired(secret *security.SecretItem) bool {
-	// Skip check if the token should not be parsed in proxy.
-	// Parsing token may not always be possible because token may not be a JWT.
-	// If SkipParseToken is true, we should assume token is valid and leave token validation to CA.
-	if sc.configOptions.SkipParseToken {
-		return false
-	}
-
-	expired, err := util.IsJwtExpired(secret.Token, time.Now())
-	if err != nil {
-		cacheLog.Errorf("JWT expiration checking error: %v. Consider as expired.", err)
-		return true
-	}
-	return expired
 }
 
 // sendRetriableRequest sends retriable requests for either CSR or ExchangeToken.
@@ -1048,4 +1048,19 @@ func (sc *SecretCache) useCertToRotate() bool {
 		return false
 	}
 	return true
+}
+
+// concatCerts concatenates PEM certificates, making sure each one starts on a new line
+func concatCerts(certsPEM []string) []byte {
+	if len(certsPEM) == 0 {
+		return []byte{}
+	}
+	var certChain bytes.Buffer
+	for i, c := range certsPEM {
+		certChain.WriteString(c)
+		if i < len(certsPEM)-1 && !strings.HasSuffix(c, "\n") {
+			certChain.WriteString("\n")
+		}
+	}
+	return certChain.Bytes()
 }

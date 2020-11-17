@@ -19,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	discoveryv2 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/google/uuid"
 	"go.uber.org/atomic"
@@ -34,7 +33,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/util/sets"
-	v2 "istio.io/istio/pilot/pkg/xds/v2"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/security/pkg/server/ca/authenticate"
 )
 
@@ -122,6 +121,11 @@ type DiscoveryServer struct {
 	serverReady bool
 
 	debounceOptions debounceOptions
+
+	instanceID string
+
+	// Cache for XDS resources
+	Cache model.XdsCache
 }
 
 // EndpointShards holds the set of endpoint shards of a service. Registries update
@@ -145,10 +149,9 @@ type EndpointShards struct {
 }
 
 // NewDiscoveryServer creates DiscoveryServer that sources data from Pilot's internal mesh data structures
-func NewDiscoveryServer(env *model.Environment, plugins []string) *DiscoveryServer {
+func NewDiscoveryServer(env *model.Environment, plugins []string, instanceID string) *DiscoveryServer {
 	out := &DiscoveryServer{
 		Env:                     env,
-		ConfigGenerator:         core.NewConfigGenerator(plugins),
 		Generators:              map[string]model.XdsResourceGenerator{},
 		EndpointShardsByService: map[string]map[string]*EndpointShards{},
 		concurrentPushLimit:     make(chan struct{}, features.PushThrottle),
@@ -162,17 +165,8 @@ func NewDiscoveryServer(env *model.Environment, plugins []string) *DiscoveryServ
 			debounceMax:       features.DebounceMax,
 			enableEDSDebounce: features.EnableEDSDebounce.Get(),
 		},
-	}
-
-	if features.XDSAuth {
-		// This is equivalent with the mTLS authentication for workload-to-workload.
-		// The GRPC server is configured in bootstrap.initSecureDiscoveryService, using the root
-		// certificate as 'ClientCAs'. To accept additional signers for client identities - add them
-		// there, will be used for CA signing as well.
-		out.Authenticators = append(out.Authenticators, &authenticate.ClientCertAuthenticator{})
-
-		// TODO: we may want to support JWT/OIDC auth as well - using the same list of auth as
-		// CA. Will require additional refactoring - probably best for 1.7.
+		Cache:      model.DisabledCache{},
+		instanceID: instanceID,
 	}
 
 	// Flush cached discovery responses when detecting jwt public key change.
@@ -181,6 +175,12 @@ func NewDiscoveryServer(env *model.Environment, plugins []string) *DiscoveryServ
 	}
 
 	out.initGenerators()
+
+	if features.EnableXDSCaching {
+		out.Cache = model.NewXdsCache()
+	}
+
+	out.ConfigGenerator = core.NewConfigGenerator(plugins, out.Cache)
 
 	return out
 }
@@ -191,13 +191,13 @@ func (s *DiscoveryServer) Register(rpcs *grpc.Server) {
 	discovery.RegisterAggregatedDiscoveryServiceServer(rpcs, s)
 }
 
-func (s *DiscoveryServer) RegisterLegacyv2(rpcs *grpc.Server) {
-	// Register v2 server just for compatibility with gRPC. When gRPC v3 comes out, we can drop this
-	discoveryv2.RegisterAggregatedDiscoveryServiceServer(rpcs, s.createV2Adapter())
-}
+var (
+	processStartTime = time.Now()
+)
 
 // CachesSynced is called when caches have been synced so that server can accept connections.
 func (s *DiscoveryServer) CachesSynced() {
+	adsLog.Infof("All caches have been synced up in %v, marking server ready", time.Since(processStartTime))
 	s.updateMutex.Lock()
 	s.serverReady = true
 	s.updateMutex.Unlock()
@@ -210,6 +210,9 @@ func (s *DiscoveryServer) IsServerReady() bool {
 }
 
 func (s *DiscoveryServer) Start(stopCh <-chan struct{}) {
+	if s.InternalGen != nil {
+		s.InternalGen.Run(stopCh)
+	}
 	go s.handleUpdates(stopCh)
 	go s.periodicRefreshMetrics(stopCh)
 	go s.sendPushes(stopCh)
@@ -245,8 +248,6 @@ func (s *DiscoveryServer) periodicRefreshMetrics(stopCh <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			push := s.globalPushContext()
-			push.Mutex.Lock()
-
 			model.LastPushMutex.Lock()
 			if model.LastPushStatus != push {
 				model.LastPushStatus = push
@@ -255,8 +256,6 @@ func (s *DiscoveryServer) periodicRefreshMetrics(stopCh <-chan struct{}) {
 				adsLog.Infof("Push Status: %s", string(out))
 			}
 			model.LastPushMutex.Unlock()
-
-			push.Mutex.Unlock()
 		case <-stopCh:
 			return
 		}
@@ -417,7 +416,11 @@ func doSendPushes(stopCh <-chan struct{}, semaphore chan struct{}, queue *PushQu
 			semaphore <- struct{}{}
 
 			// Get the next proxy to push. This will block if there are no updates required.
-			client, push := queue.Dequeue()
+			client, push, shuttingdown := queue.Dequeue()
+
+			if shuttingdown {
+				return
+			}
 			recordPushTriggers(push.Reason...)
 			// Signals that a push is done by reading from the semaphore, allowing another send on it.
 			doneFunc := func() {
@@ -472,14 +475,29 @@ func (s *DiscoveryServer) sendPushes(stopCh <-chan struct{}) {
 
 // initGenerators initializes generators to be used by XdsServer.
 func (s *DiscoveryServer) initGenerators() {
+	edsGen := &EdsGenerator{Server: s}
+	s.InternalGen = NewInternalGen(s)
+	s.Generators[v3.ClusterType] = &CdsGenerator{Server: s}
+	s.Generators[v3.ListenerType] = &LdsGenerator{Server: s}
+	s.Generators[v3.RouteType] = &RdsGenerator{Server: s}
+	s.Generators[v3.EndpointType] = edsGen
+	s.Generators[v3.NameTableType] = &NdsGenerator{Server: s}
+
 	s.Generators["grpc"] = &grpcgen.GrpcConfigGenerator{}
-	epGen := &EdsGenerator{Server: s}
-	s.Generators["grpc/"+v2.EndpointType] = epGen
+	s.Generators["grpc/"+v3.EndpointType] = edsGen
+	s.Generators["grpc/"+v3.ListenerType] = s.Generators["grpc"]
+	s.Generators["grpc/"+v3.RouteType] = s.Generators["grpc"]
+	s.Generators["grpc/"+v3.ClusterType] = s.Generators["grpc"]
+
 	s.Generators["api"] = &apigen.APIGenerator{}
-	s.Generators["api/"+v2.EndpointType] = epGen
-	s.InternalGen = &InternalGen{
-		Server: s,
-	}
+	s.Generators["api/"+v3.EndpointType] = edsGen
+
 	s.Generators["api/"+TypeURLConnections] = s.InternalGen
+
 	s.Generators["event"] = s.InternalGen
+}
+
+// shutdown shutsdown DiscoveryServer components.
+func (s *DiscoveryServer) Shutdown() {
+	s.pushQueue.ShutDown()
 }

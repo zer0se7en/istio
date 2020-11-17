@@ -36,10 +36,12 @@ import (
 
 	"istio.io/istio/istioctl/pkg/clioptions"
 	"istio.io/istio/istioctl/pkg/install/k8sversion"
+	"istio.io/istio/istioctl/pkg/verifier"
 	operator_istio "istio.io/istio/operator/pkg/apis/istio"
 	operator_v1alpha1 "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/url"
 )
 
 var (
@@ -97,7 +99,7 @@ func installPreCheck(istioNamespaceFlag string, restClientGetter genericclioptio
 		errs = multierror.Append(errs, err)
 		fmt.Fprint(writer, err)
 	} else if !res {
-		msg := fmt.Sprintf("The Kubernetes API version: %v is lower than the minimum version: "+k8sversion.MinK8SVersion, v)
+		msg := fmt.Sprintf("The Kubernetes API version: %v is lower than the minimum version: 1.%d", v, k8sversion.MinK8SVersion)
 		errs = multierror.Append(errs, errors.New(msg))
 		fmt.Fprintf(writer, msg+"\n")
 	} else {
@@ -198,10 +200,10 @@ func installPreCheck(istioNamespaceFlag string, restClientGetter genericclioptio
 	err = c.checkMutatingWebhook()
 	if err != nil {
 		fmt.Fprintf(writer, "This Kubernetes cluster deployed without MutatingAdmissionWebhook support."+
-			"See https://istio.io/docs/setup/kubernetes/additional-setup/sidecar-injection/#automatic-sidecar-injection\n")
+			"See "+url.SidecarInjection+"\n")
 	} else {
 		fmt.Fprintf(writer, "This Kubernetes cluster supports automatic sidecar injection."+
-			" To enable automatic sidecar injection see https://istio.io/docs/setup/kubernetes/additional-setup/sidecar-injection/#deploying-an-app\n")
+			" To enable automatic sidecar injection see "+url.SidecarDeployingApp+"\n")
 	}
 	fmt.Fprintf(writer, "\n")
 	fmt.Fprintf(writer, "-----------------------\n")
@@ -233,7 +235,7 @@ func checkCanCreateResources(c preCheckExecClient, namespace, group, version, na
 
 	if !response.Status.Allowed {
 		if len(response.Status.Reason) > 0 {
-			msg := fmt.Sprintf("Istio installation will not succeed.Create permission lacking for:%s: %v", name, response.Status.Reason)
+			msg := fmt.Sprintf("Istio installation will not succeed. Create permission lacking for:%s: %v", name, response.Status.Reason)
 			return errors.New(msg)
 		}
 		msg := fmt.Sprintf("Istio installation will not succeed. Create permission lacking for:%s", name)
@@ -305,18 +307,16 @@ func NewPrecheckCommand() *cobra.Command {
 		Use:   "precheck [-f <deployment or istio operator file>]",
 		Short: "Checks Istio cluster compatibility",
 		Long: `
-		precheck inspects a Kubernetes cluster for Istio install requirements.
+  precheck inspects a Kubernetes cluster for Istio install requirements.
 `,
-		Example: `
-		# Verify that Istio can be installed
-		istioctl experimental precheck
+		Example: `  # Verify that Istio can be installed
+  istioctl experimental precheck
 
-		# Verify the deployment matches a custom Istio deployment configuration
-		istioctl x precheck --set profile=demo
+  # Verify the deployment matches a custom Istio deployment configuration
+  istioctl x precheck --set profile=demo
 
-		# Verify the deployment matches the Istio Operator deployment definition
-		istioctl x precheck -f iop.yaml
-`,
+  # Verify the deployment matches the Istio Operator deployment definition
+  istioctl x precheck -f iop.yaml`,
 		Args: cobra.ExactArgs(0),
 		RunE: func(c *cobra.Command, args []string) error {
 			targetNamespace := istioNamespace
@@ -374,7 +374,7 @@ func NewPrecheckCommand() *cobra.Command {
 
 			// The Istio namespace does exist, but it wasn't installed by 1.6.0+ because no
 			// IstioOperator is there.
-			c.Printf("Istio already installed in namespace %q.  Skipping pre-check.  Confirm with 'istioctl verify-install'.\n", targetNamespace)
+			c.Printf("Istio is already installed in the %q namespace. Skipping pre-check. Confirm with 'istioctl verify-install'.\n", targetNamespace)
 			c.Printf("Use 'istioctl upgrade' to upgrade or 'istioctl install --set revision=<revision>' to install another control plane.\n")
 			return nil
 		},
@@ -393,7 +393,7 @@ func findIstios(client dynamic.Interface) ([]istioInstall, error) {
 	retval := make([]istioInstall, 0)
 
 	// First, look for IstioOperator CRs left by 'istioctl install' or 'kubectl apply'
-	iops, err := allOperatorsInCluster(client)
+	iops, err := verifier.AllOperatorsInCluster(client)
 	if err != nil {
 		return retval, err
 	}

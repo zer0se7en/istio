@@ -1,3 +1,4 @@
+// +build integ
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,7 +85,8 @@ func TestValidation(t *testing.T) {
 					strings.Contains(err.Error(), "is invalid")
 			}
 
-			for _, d := range dataset {
+			for i := range dataset {
+				d := dataset[i]
 				ctx.NewSubTest(string(d)).RunParallel(func(ctx framework.TestContext) {
 					if d.isSkipped() {
 						ctx.SkipNow()
@@ -143,7 +145,7 @@ var ignoredCRDs = []string{
 	"/v1/Secret",
 	"/v1/Service",
 	"/v1/ConfigMap",
-	"apiextensions.k8s.io/v1/CustomResourceDefinition",
+	"apiextensions.k8s.io/v1beta1/CustomResourceDefinition",
 	"apps/v1/Deployment",
 	"extensions/v1beta1/Ingress",
 }
@@ -182,6 +184,8 @@ func TestEnsureNoMissingCRDs(t *testing.T) {
 				"networking.x-k8s.io/v1alpha1/GatewayClass",
 				"networking.x-k8s.io/v1alpha1/HTTPRoute",
 				"networking.x-k8s.io/v1alpha1/TCPRoute",
+				"networking.x-k8s.io/v1alpha1/TLSRoute",
+				"networking.x-k8s.io/v1alpha1/BackendPolicy",
 			} {
 				delete(recognized, gvk)
 			}

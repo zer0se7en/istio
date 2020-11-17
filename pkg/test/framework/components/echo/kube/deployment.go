@@ -15,11 +15,13 @@
 package kube
 
 import (
+	"bufio"
 	"fmt"
 	"strconv"
+	"strings"
 	"text/template"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/istio"
@@ -118,6 +120,12 @@ spec:
 {{- if $p.TLS }}
           - --tls={{ $p.Port }}
 {{- end }}
+{{- if $p.ServerFirst }}
+          - --server-first={{ $p.Port }}
+{{- end }}
+{{- if $p.InstanceIP }}
+          - --bind-ip={{ $p.Port }}
+{{- end }}
 {{- end }}
 {{- range $i, $p := $.WorkloadOnlyPorts }}
 {{- if eq .Protocol "TCP" }}
@@ -128,6 +136,9 @@ spec:
           - "{{ $p.Port }}"
 {{- if $p.TLS }}
           - --tls={{ $p.Port }}
+{{- end }}
+{{- if $p.ServerFirst }}
+          - --server-first={{ $p.Port }}
 {{- end }}
 {{- end }}
           - --version
@@ -143,6 +154,11 @@ spec:
           name: tcp-health-port
 {{- end }}
 {{- end }}
+        env:
+        - name: INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         readinessProbe:
           httpGet:
             path: /
@@ -156,6 +172,13 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 10
           failureThreshold: 10
+{{- if $.StartupProbe }}
+        startupProbe:
+          tcpSocket:
+            port: tcp-health-port
+          periodSeconds: 10
+          failureThreshold: 10
+{{- end }}
 {{- if $.TLSSettings }}
         volumeMounts:
         - mountPath: /etc/certs/custom
@@ -243,18 +266,46 @@ spec:
           # Capture all inbound and outbound traffic
           sudo sh -c 'echo ISTIO_SERVICE_CIDR=* >> /var/lib/istio/envoy/cluster.env'
           sudo sh -c 'echo ISTIO_INBOUND_PORTS=* >> /var/lib/istio/envoy/cluster.env'
-          # Use token auth not certs
-          sudo sh -c 'echo PROV_CERT="" >> /var/lib/istio/envoy/cluster.env'
+          
+          # Read root cert from and place signed certs here
+          sudo mkdir -p /var/run/secrets/istio
+ 
+          # hack: remove certs that are bundled in the image
+          sudo rm /var/run/secrets/istio/cert-chain.pem  
+          sudo rm /var/run/secrets/istio/key.pem  
+          sudo chown -R istio-proxy /var/run/secrets
+
+          # replace root-cert with what was mounted
+          sudo cp /var/run/secrets/istio/rootmount/* /var/run/secrets/istio
+          sudo sh -c 'echo PROV_CERT=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
+          sudo sh -c 'echo OUTPUT_CERTS=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
           # Block standard inbound ports
           sudo sh -c 'echo ISTIO_LOCAL_EXCLUDE_PORTS="15090,15021,15020" >> /var/lib/istio/envoy/cluster.env'
+          # Proxy XDS via agent first
+          sudo sh -c 'echo PROXY_XDS_VIA_AGENT=true >> /var/lib/istio/envoy/cluster.env'
+          {{- if $.VM.AutoRegister }}
+          sudo sh -c 'echo ISTIO_META_AUTO_REGISTER_GROUP={{$.Service}} >> /var/lib/istio/envoy/cluster.env'
+          {{- end }}
           # Capture all DNS traffic in the VM and forward to Envoy
-          # sudo sh -c 'echo ISTIO_META_DNS_CAPTURE=ALL >> /var/lib/istio/envoy/cluster.env'
+          sudo sh -c 'echo ISTIO_META_DNS_CAPTURE=true >> /var/lib/istio/envoy/cluster.env'
           sudo sh -c 'echo ISTIO_PILOT_PORT={{$.VM.IstiodPort}} >> /var/lib/istio/envoy/cluster.env'
 
           # Setup the namespace
           sudo sh -c 'echo ISTIO_NAMESPACE={{ $.Namespace }} >> /var/lib/istio/envoy/sidecar.env'
 
           sudo sh -c 'echo "{{$.VM.IstiodIP}} istiod.istio-system.svc" >> /etc/hosts'
+
+          # Provide a proxyconfig override
+          
+          {{- range $name, $value := $subset.Annotations }}
+          {{- if eq $name.Name "proxy.istio.io/config" }}
+          sudo sh -c 'chmod a+w /etc/istio/config/mesh'
+          sudo sh -c 'echo "defaultConfig:" >> /etc/istio/config/mesh'
+          {{- range $idx, $line := (Lines $value.Value) }}
+          sudo sh -c 'echo "  {{ $line }}" >> /etc/istio/config/mesh'
+          {{- end }}
+          {{- end }}
+          {{- end }}
 
           # TODO: run with systemctl?
           export ISTIO_AGENT_FLAGS="--concurrency 2"
@@ -269,8 +320,18 @@ spec:
              --port \
 {{- end }}
              "{{ $p.Port }}" \
+{{- if $p.ServerFirst }}
+             --server-first={{ $p.Port }} \
+{{- end }}
+{{- if $p.InstanceIP }}
+             --bind-ip={{ $p.Port }} \
+{{- end }}
 {{- end }}
         env:
+        - name: INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         {{- range $name, $value := $.Environment }}
         - name: {{ $name }}
           value: "{{ $value }}"
@@ -285,8 +346,14 @@ spec:
         volumeMounts:
         - mountPath: /var/run/secrets/tokens
           name: {{ $.Service }}-istio-token
-        - mountPath: /var/run/secrets/istio
+        - mountPath: /var/run/secrets/istio/rootmount
           name: istio-ca-root-cert
+        {{- range $name, $value := $subset.Annotations }}
+        {{- if eq $name.Name "sidecar.istio.io/bootstrapOverride" }}
+        - mountPath: /etc/istio/custom-bootstrap
+          name: custom-bootstrap-volume
+        {{- end }}
+        {{- end }}
       volumes:
       - secret:
           secretName: {{ $.Service }}-istio-token
@@ -294,6 +361,13 @@ spec:
       - configMap:
           name: istio-ca-root-cert
         name: istio-ca-root-cert
+      {{- range $name, $value := $subset.Annotations }}
+      {{- if eq $name.Name "sidecar.istio.io/bootstrapOverride" }}
+      - name: custom-bootstrap-volume
+        configMap:
+          name: {{ $value.Value }}
+      {{- end }}
+      {{- end }}
 {{- end}}
 `
 )
@@ -316,7 +390,7 @@ func init() {
 	}
 
 	vmDeploymentTemplate = template.New("echo_vm_deployment")
-	if _, err := vmDeploymentTemplate.Funcs(sprig.TxtFuncMap()).Parse(vmDeploymentYaml); err != nil {
+	if _, err := vmDeploymentTemplate.Funcs(sprig.TxtFuncMap()).Funcs(template.FuncMap{"Lines": lines}).Parse(vmDeploymentYaml); err != nil {
 		panic(fmt.Sprintf("unable to parse echo vm deployment template: %v", err))
 	}
 }
@@ -335,6 +409,15 @@ const DefaultVMImage = "app_sidecar_ubuntu_bionic"
 func generateYAMLWithSettings(
 	ctx resource.Context, cfg echo.Config,
 	settings *image.Settings, cluster resource.Cluster) (serviceYAML string, deploymentYAML string, err error) {
+	ver, err := cluster.GetKubernetesVersion()
+	if err != nil {
+		return "", "", err
+	}
+	supportStartupProbe := true
+	if ver.Minor < "16" {
+		// Added in Kubernetes 1.16
+		supportStartupProbe = false
+	}
 	// Convert legacy config to workload oritended.
 	if cfg.Subsets == nil {
 		cfg.Subsets = []echo.SubsetConfig{
@@ -352,6 +435,7 @@ func generateYAMLWithSettings(
 
 	var vmImage, istiodIP, istiodPort string
 	if cfg.DeployAsVM {
+		// TODO if possible, use istioctl x workload ... to configure the VM
 		ist, err := istio.Get(ctx)
 		if err != nil {
 			return "", "", err
@@ -377,7 +461,7 @@ func generateYAMLWithSettings(
 	}
 	params := map[string]interface{}{
 		"Hub":                settings.Hub,
-		"Tag":                settings.Tag,
+		"Tag":                strings.TrimSuffix(settings.Tag, "-distroless"),
 		"PullPolicy":         settings.PullPolicy,
 		"Service":            cfg.Service,
 		"Version":            cfg.Version,
@@ -393,11 +477,13 @@ func generateYAMLWithSettings(
 		"Cluster":            cfg.Cluster.Name(),
 		"Namespace":          namespace,
 		"VM": map[string]interface{}{
-			"Image":      vmImage,
-			"IstiodIP":   istiodIP,
-			"IstiodPort": istiodPort,
+			"Image":        vmImage,
+			"IstiodIP":     istiodIP,
+			"IstiodPort":   istiodPort,
+			"AutoRegister": cfg.AutoRegisterVM,
 		},
-		"Environment": cfg.VMEnvironment,
+		"Environment":  cfg.VMEnvironment,
+		"StartupProbe": supportStartupProbe,
 	}
 
 	serviceYAML, err = tmpl.Execute(serviceTemplate, params)
@@ -413,4 +499,13 @@ func generateYAMLWithSettings(
 	// Generate the YAML content.
 	deploymentYAML, err = tmpl.Execute(deploy, params)
 	return
+}
+
+func lines(input string) []string {
+	out := []string{}
+	scanner := bufio.NewScanner(strings.NewReader(input))
+	for scanner.Scan() {
+		out = append(out, scanner.Text())
+	}
+	return out
 }

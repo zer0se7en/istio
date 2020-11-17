@@ -169,6 +169,17 @@ var testGrid = []testCase{
 		},
 	},
 	{
+		name: "istioInjectionProxyImageMismatchAbsolute",
+		inputFiles: []string{
+			"testdata/injection-with-mismatched-sidecar.yaml",
+			"testdata/sidecar-injector-configmap-absolute-override.yaml",
+		},
+		analyzer: &injection.ImageAnalyzer{},
+		expected: []message{
+			{msg.IstioProxyImageMismatch, "Pod details-v1-pod-old.enabled-namespace"},
+		},
+	},
+	{
 		name:       "portNameNotFollowConvention",
 		inputFiles: []string{"testdata/service-no-port-name.yaml"},
 		analyzer:   &service.PortNameAnalyzer{},
@@ -253,6 +264,10 @@ var testGrid = []testCase{
 		analyzer:   &virtualservice.GatewayAnalyzer{},
 		expected: []message{
 			{msg.ReferencedResourceNotFound, "VirtualService httpbin-bogus"},
+
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService cross-test.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService httpbin-bogus"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService httpbin"},
 		},
 	},
 	{
@@ -380,6 +395,41 @@ var testGrid = []testCase{
 		},
 		analyzer: &destinationrule.CaCertificateAnalyzer{},
 		expected: []message{},
+	},
+	{
+		name: "dupmatches",
+		inputFiles: []string{
+			"testdata/virtualservice_dupmatches.yaml",
+		},
+		analyzer: &virtualservice.MatchesAnalyzer{},
+		expected: []message{
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-match"},
+			{msg.VirtualServiceUnreachableRule, "VirtualService sample-foo-cluster01.foo"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService almost-duplicate-match"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService duplicate-match"},
+
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-tcp-match"},
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-empty-tcp"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService almost-duplicate-tcp-match"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService duplicate-tcp-match"},
+
+			{msg.VirtualServiceUnreachableRule, "VirtualService tls-routing.none"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService tls-routing-almostmatch.none"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService tls-routing.none"},
+		},
+	},
+	{
+		name: "host defined in virtualservice not found in the gateway",
+		inputFiles: []string{
+			"testdata/virtualservice_host_not_found_gateway.yaml",
+		},
+		analyzer: &virtualservice.GatewayAnalyzer{},
+		expected: []message{
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-01.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-02.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-03.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-03-test-04.default"},
+		},
 	},
 }
 

@@ -28,12 +28,7 @@ type operatorDumpArgs struct {
 
 func addOperatorDumpFlags(cmd *cobra.Command, args *operatorDumpArgs) {
 	hub, tag := buildversion.DockerInfo.Hub, buildversion.DockerInfo.Tag
-	if hub == "" {
-		hub = "gcr.io/istio-testing"
-	}
-	if tag == "" {
-		tag = "latest"
-	}
+
 	cmd.PersistentFlags().StringVar(&args.common.hub, "hub", hub, HubFlagHelpStr)
 	cmd.PersistentFlags().StringVar(&args.common.tag, "tag", tag, TagFlagHelpStr)
 	cmd.PersistentFlags().StringVar(&args.common.operatorNamespace, "operatorNamespace", operatorDefaultNamespace, OperatorNamespaceHelpstr)
@@ -41,6 +36,8 @@ func addOperatorDumpFlags(cmd *cobra.Command, args *operatorDumpArgs) {
 		"The namespace Istio is installed into")
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "charts", "", "", ChartsDeprecatedStr)
 	cmd.PersistentFlags().StringVarP(&args.common.manifestsPath, "manifests", "d", "", ManifestsFlagHelpStr)
+	cmd.PersistentFlags().StringVarP(&args.common.revision, "revision", "r", "",
+		revisionFlagHelpStr)
 }
 
 func operatorDumpCmd(rootArgs *rootArgs, odArgs *operatorDumpArgs) *cobra.Command {

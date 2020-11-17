@@ -81,7 +81,7 @@ func DefaultMeshConfig() meshconfig.MeshConfig {
 		AccessLogEncoding:           meshconfig.MeshConfig_TEXT,
 		AccessLogFormat:             "",
 		EnableEnvoyAccessLogService: false,
-		ProtocolDetectionTimeout:    types.DurationProto(5 * time.Second),
+		ProtocolDetectionTimeout:    types.DurationProto(0),
 		IngressService:              "istio-ingressgateway",
 		IngressControllerMode:       meshconfig.MeshConfig_STRICT,
 		IngressClass:                "istio",
@@ -172,6 +172,18 @@ func ApplyMeshConfig(yaml string, defaultConfig meshconfig.MeshConfig) (*meshcon
 // input YAML with defaults applied to omitted configuration values.
 func ApplyMeshConfigDefaults(yaml string) (*meshconfig.MeshConfig, error) {
 	return ApplyMeshConfig(yaml, DefaultMeshConfig())
+}
+
+func DeepCopyMeshConfig(mc *meshconfig.MeshConfig) (*meshconfig.MeshConfig, error) {
+	j, err := gogoprotomarshal.ToJSON(mc)
+	if err != nil {
+		return nil, err
+	}
+	nmc := &meshconfig.MeshConfig{}
+	if err := gogoprotomarshal.ApplyJSON(j, nmc); err != nil {
+		return nil, err
+	}
+	return nmc, nil
 }
 
 // EmptyMeshNetworks configuration with no networks

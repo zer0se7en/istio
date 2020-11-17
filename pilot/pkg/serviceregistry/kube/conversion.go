@@ -109,6 +109,7 @@ func ConvertService(svc coreV1.Service, domainSuffix string, clusterID string) *
 			ServiceRegistry: string(serviceregistry.Kubernetes),
 			Name:            svc.Name,
 			Namespace:       svc.Namespace,
+			Labels:          svc.Labels,
 			UID:             formatUID(svc.Namespace, svc.Name),
 			ExportTo:        exportTo,
 			LabelSelectors:  labelSelectors,
@@ -149,6 +150,13 @@ func ConvertService(svc coreV1.Service, domainSuffix string, clusterID string) *
 		}
 	}
 
+	for _, extIP := range svc.Spec.ExternalIPs {
+		if istioService.Attributes.ClusterExternalAddresses == nil {
+			istioService.Attributes.ClusterExternalAddresses = map[string][]string{}
+		}
+		istioService.Attributes.ClusterExternalAddresses[clusterID] = append(istioService.Attributes.ClusterExternalAddresses[clusterID], extIP)
+	}
+
 	return istioService
 }
 
@@ -184,12 +192,6 @@ func kubeToIstioServiceAccount(saname string, ns string) string {
 
 // SecureNamingSAN creates the secure naming used for SAN verification from pod metadata
 func SecureNamingSAN(pod *coreV1.Pod) string {
-
-	//use the identity annotation
-	if identity, exist := pod.Annotations[annotation.AlphaIdentity.Name]; exist {
-		return spiffe.GenCustomSpiffe(identity)
-	}
-
 	return spiffe.MustGenSpiffeURI(pod.Namespace, pod.Spec.ServiceAccountName)
 }
 

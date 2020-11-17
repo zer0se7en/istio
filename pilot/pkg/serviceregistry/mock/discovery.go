@@ -36,6 +36,8 @@ var (
 	}
 )
 
+var _ model.ServiceDiscovery = &ServiceDiscovery{}
+
 // NewDiscovery builds a memory ServiceDiscovery
 func NewDiscovery(services map[host.Name]*model.Service, versions int) *ServiceDiscovery {
 	return &ServiceDiscovery{
@@ -155,7 +157,6 @@ type ServiceDiscovery struct {
 	WantGetProxyServiceInstances  []*model.ServiceInstance
 	ServicesError                 error
 	GetServiceError               error
-	InstancesError                error
 	GetProxyServiceInstancesError error
 }
 
@@ -181,17 +182,13 @@ func (sd *ServiceDiscovery) GetService(hostname host.Name) (*model.Service, erro
 }
 
 // InstancesByPort implements discovery interface
-func (sd *ServiceDiscovery) InstancesByPort(svc *model.Service, num int,
-	labels labels.Collection) ([]*model.ServiceInstance, error) {
-	if sd.InstancesError != nil {
-		return nil, sd.InstancesError
-	}
+func (sd *ServiceDiscovery) InstancesByPort(svc *model.Service, num int, labels labels.Collection) []*model.ServiceInstance {
 	if _, ok := sd.services[svc.Hostname]; !ok {
-		return nil, sd.InstancesError
+		return nil
 	}
 	out := make([]*model.ServiceInstance, 0)
 	if svc.External() {
-		return out, sd.InstancesError
+		return out
 	}
 	if port, ok := svc.Ports.GetByPort(num); ok {
 		for v := 0; v < sd.versions; v++ {
@@ -200,16 +197,16 @@ func (sd *ServiceDiscovery) InstancesByPort(svc *model.Service, num int,
 			}
 		}
 	}
-	return out, sd.InstancesError
+	return out
 }
 
 // GetProxyServiceInstances implements discovery interface
-func (sd *ServiceDiscovery) GetProxyServiceInstances(node *model.Proxy) ([]*model.ServiceInstance, error) {
+func (sd *ServiceDiscovery) GetProxyServiceInstances(node *model.Proxy) []*model.ServiceInstance {
 	if sd.GetProxyServiceInstancesError != nil {
-		return nil, sd.GetProxyServiceInstancesError
+		return nil
 	}
 	if sd.WantGetProxyServiceInstances != nil {
-		return sd.WantGetProxyServiceInstances, nil
+		return sd.WantGetProxyServiceInstances
 	}
 	out := make([]*model.ServiceInstance, 0)
 	for _, service := range sd.services {
@@ -225,15 +222,15 @@ func (sd *ServiceDiscovery) GetProxyServiceInstances(node *model.Proxy) ([]*mode
 
 		}
 	}
-	return out, sd.GetProxyServiceInstancesError
+	return out
 }
 
-func (sd *ServiceDiscovery) GetProxyWorkloadLabels(proxy *model.Proxy) (labels.Collection, error) {
+func (sd *ServiceDiscovery) GetProxyWorkloadLabels(proxy *model.Proxy) labels.Collection {
 	if sd.GetProxyServiceInstancesError != nil {
-		return nil, sd.GetProxyServiceInstancesError
+		return nil
 	}
 	// no useful labels from the ServiceInstances created by newServiceInstance()
-	return nil, nil
+	return nil
 }
 
 // GetIstioServiceAccounts gets the Istio service accounts for a service hostname.
@@ -246,19 +243,16 @@ func (sd *ServiceDiscovery) GetIstioServiceAccounts(svc *model.Service, ports []
 	return make([]string, 0)
 }
 
+func (sd *ServiceDiscovery) NetworkGateways() map[string][]*model.Gateway {
+	// TODO use logic from kube controller if needed
+	panic("implement me")
+}
+
 type Controller struct{}
 
-func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) error {
-	return nil
-}
+func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) {}
 
-func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
-	return nil
-}
-
-func (c *Controller) AppendWorkloadHandler(f func(*model.WorkloadInstance, model.Event)) error {
-	return nil
-}
+func (c *Controller) AppendWorkloadHandler(f func(*model.WorkloadInstance, model.Event)) {}
 
 func (c *Controller) Run(<-chan struct{}) {}
 

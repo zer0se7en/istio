@@ -1,3 +1,4 @@
+// +build integ
 // Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +19,12 @@ import (
 	"fmt"
 	"testing"
 
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/echo/client"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/features"
 	"istio.io/istio/pkg/test/framework/label"
+	"istio.io/istio/pkg/test/framework/resource"
 )
 
 func LoadbalancingTest(t *testing.T, apps AppContext, features ...features.Feature) {
@@ -37,39 +38,45 @@ func LoadbalancingTest(t *testing.T, apps AppContext, features ...features.Featu
 						src := src
 						ctx.NewSubTest(fmt.Sprintf("from %s", src.Config().Cluster.Name())).
 							Run(func(ctx framework.TestContext) {
-								EquallyDistributedOrFail(ctx, callOrFail(ctx, src, apps.LBEchos[0]), apps.LBEchos)
+								srcNetwork := src.Config().Cluster.NetworkName()
+								callOrFail(ctx, src, apps.LBEchos[0],
+									echo.And(
+										checkReachedAllSubsets(apps.LBEchos),
+										checkEqualIntraNetworkTraffic(ctx.Clusters(), srcNetwork)))
 							})
 					}
 				})
 		})
 }
 
-// EquallyDistributedOrFail fails the test if responses aren't equally distributed across clusters for the given set of echos.
-func EquallyDistributedOrFail(ctx test.Failer, res client.ParsedResponses, echos echo.Instances) {
-	// verify we reached all instances by using ParsedResponse
-	clusterHits := map[string]int{}
-	for _, r := range res {
-		clusterHits[r.Cluster]++
-	}
-	// TODO(landow) this check can be removed if the other is uncommented
-	for _, inst := range echos {
-		hits := clusterHits[inst.Config().Cluster.Name()]
-		if hits < 1 {
-			ctx.Fatalf("expected requests to reach all clusters: %v", clusterHits)
+func checkReachedAllSubsets(echos echo.Instances) echo.Validator {
+	return echo.ValidatorFunc(func(res client.ParsedResponses, _ error) error {
+		// make sure we reached all cluster/subset combos
+		for _, e := range echos {
+			for _, ss := range e.Config().Subsets {
+				version, cluster := ss.Version, e.Config().Cluster.Name()
+				responses := res.Match(func(r *client.ParsedResponse) bool {
+					return r.Cluster == cluster && r.Version == version
+				})
+				if len(responses) < 1 {
+					return fmt.Errorf("did not reach %s in %s", version, cluster)
+				}
+			}
 		}
-	}
+		return nil
+	})
+}
 
-	// TODO(landow) check this when cross-network traffic weighting is fixed
-	//equal := true
-	//expected := len(res) / len(echos)
-	//for _, inst := range echos {
-	//	hits := clusterHits[inst.Config().Cluster.Name()]
-	//	if !almostEquals(hits, expected, expected/5) {
-	//		equal = false
-	//		break
-	//	}
-	//}
-	//if !equal {
-	//	ctx.Fatalf("requests were not equally distributed among clusters: %v", clusterHits)
-	//}
+func checkEqualIntraNetworkTraffic(clusters resource.Clusters, srcNetwork string) echo.Validator {
+	// expect same network traffic to have very equal distribution (20% error)
+	intraNetworkClusters := clusters.ByNetwork()[srcNetwork]
+	return echo.ValidatorFunc(func(res client.ParsedResponses, _ error) error {
+		intraNetworkRes := res.Match(func(r *client.ParsedResponse) bool {
+			return srcNetwork == clusters.GetByName(r.Cluster).NetworkName()
+		})
+		if err := intraNetworkRes.CheckEqualClusterTraffic(intraNetworkClusters, 20); err != nil {
+			return fmt.Errorf("same network traffic was not even: %v", err)
+		}
+		return nil
+	})
 }

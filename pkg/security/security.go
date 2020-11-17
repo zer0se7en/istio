@@ -16,9 +16,12 @@ package security
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+
+	"istio.io/pkg/env"
 )
 
 const (
@@ -40,14 +43,28 @@ const (
 	Mock = "Mock" // testing only
 )
 
+// TODO: For 1.8, make sure MeshConfig is updated with those settings,
+// they should be dynamic to allow migrations without restart.
+// Both are critical.
+var (
+	// Require 3P TOKEN disables the use of K8S 1P tokens. Note that 1P tokens can be used to request
+	// 3P TOKENS. A 1P token is the token automatically mounted by Kubelet and used for authentication with
+	// the Apiserver.
+	Require3PToken = env.RegisterBoolVar("REQUIRE_3P_TOKEN", false,
+		"Reject k8s default tokens, without audience. If false, default K8S token will be accepted")
+
+	// TokenAudiences specifies a list of audiences for SDS trustworthy JWT. This is to make sure that the CSR requests
+	// contain the JWTs intended for Citadel.
+	TokenAudiences = strings.Split(env.RegisterStringVar("TOKEN_AUDIENCES", "istio-ca",
+		"A list of comma separated audiences to check in the JWT token before issuing a certificate. "+
+			"The token is accepted if it matches with one of the audiences").Get(), ",")
+)
+
 // Options provides all of the configuration parameters for secret discovery service
 // and CA configuration. Used in both Istiod and Agent.
 // TODO: ProxyConfig should have most of those, and be passed to all components
 // (as source of truth)
 type Options struct {
-	// PluginNames is plugins' name for certain authentication provider.
-	PluginNames []string
-
 	// WorkloadUDSPath is the unix domain socket through which SDS server communicates with workload proxies.
 	WorkloadUDSPath string
 
@@ -118,9 +135,6 @@ type Options struct {
 	// when do mtls
 	ProvCert string
 
-	// Existing certs, for VM or existing certificates
-	CertsDir string
-
 	// whether  ControlPlaneAuthPolicy is MUTUAL_TLS
 	TLSEnabled bool
 
@@ -177,9 +191,14 @@ type Options struct {
 	// credential fetcher.
 	CredFetcher CredFetcher
 
-	// whether need to skip parsing token to inspect information like expiration time
-	// Default is false.
-	SkipParseToken bool
+	// credential identity provider
+	CredIdentityProvider string
+
+	// Namespace corresponding to workload
+	WorkloadNamespace string
+
+	// Name of the Service Account
+	ServiceAccount string
 }
 
 // Client interface defines the clients need to implement to talk to CA for CSR.

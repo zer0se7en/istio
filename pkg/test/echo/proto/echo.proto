@@ -48,6 +48,11 @@ message ForwardEchoRequest {
   bool http2 = 7;
   // If true, requests will not be sent until magic string is received
   bool serverFirst = 8;
+  // If non-empty, make the request with the corresponding cert and key.
+  string cert = 10;
+  string key = 11;
+  // If non-empty, verify the server CA
+  string caCert = 12;
 }
 
 message ForwardEchoResponse {

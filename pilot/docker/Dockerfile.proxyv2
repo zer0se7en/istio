@@ -5,7 +5,7 @@ ARG BASE_DISTRIBUTION=default
 ARG BASE_VERSION=latest
 
 # The following section is used as base image if BASE_DISTRIBUTION=default
-FROM docker.io/istio/base:${BASE_VERSION} as default
+FROM gcr.io/istio-release/base:${BASE_VERSION} as default
 
 # Copy Envoy bootstrap templates used by pilot-agent
 COPY envoy_bootstrap.json /var/lib/istio/envoy/envoy_bootstrap_tmpl.json
@@ -45,8 +45,6 @@ ENV ISTIO_META_ISTIO_PROXY_SHA $proxy_version
 ENV ISTIO_META_ISTIO_VERSION $istio_version
 
 COPY pilot-agent /usr/local/bin/pilot-agent
-
-COPY envoy_policy.yaml.tmpl /var/lib/istio/envoy/envoy_policy.yaml.tmpl
 
 COPY stats-filter.wasm /etc/istio/extensions/stats-filter.wasm
 COPY stats-filter.compiled.wasm /etc/istio/extensions/stats-filter.compiled.wasm

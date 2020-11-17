@@ -65,11 +65,18 @@ func GetAuthorizationPolicies(env *Environment) (*AuthorizationPolicies, error) 
 	return policy, nil
 }
 
-// ListAuthorizationPolicies returns the deny and allow AuthorizationPolicy for the workload in the given namespace.
-func (policy *AuthorizationPolicies) ListAuthorizationPolicies(namespace string, workload labels.Collection) (
-	denyPolicies []AuthorizationPolicy, allowPolicies []AuthorizationPolicy) {
+type AuthorizationPoliciesResult struct {
+	Custom []AuthorizationPolicy
+	Deny   []AuthorizationPolicy
+	Allow  []AuthorizationPolicy
+	Audit  []AuthorizationPolicy
+}
+
+// ListAuthorizationPolicies returns authorization policies applied to the workload in the given namespace.
+func (policy *AuthorizationPolicies) ListAuthorizationPolicies(namespace string, workload labels.Collection) AuthorizationPoliciesResult {
+	ret := AuthorizationPoliciesResult{}
 	if policy == nil {
-		return
+		return ret
 	}
 
 	var namespaces []string
@@ -88,9 +95,13 @@ func (policy *AuthorizationPolicies) ListAuthorizationPolicies(namespace string,
 			if workload.IsSupersetOf(selector) {
 				switch config.Spec.GetAction() {
 				case authpb.AuthorizationPolicy_ALLOW:
-					allowPolicies = append(allowPolicies, config)
+					ret.Allow = append(ret.Allow, config)
 				case authpb.AuthorizationPolicy_DENY:
-					denyPolicies = append(denyPolicies, config)
+					ret.Deny = append(ret.Deny, config)
+				case authpb.AuthorizationPolicy_AUDIT:
+					ret.Audit = append(ret.Audit, config)
+				case authpb.AuthorizationPolicy_CUSTOM:
+					ret.Custom = append(ret.Custom, config)
 				default:
 					log.Errorf("ignored authorization policy %s.%s with unsupported action: %s",
 						config.Namespace, config.Name, config.Spec.GetAction())
@@ -99,5 +110,5 @@ func (policy *AuthorizationPolicies) ListAuthorizationPolicies(namespace string,
 		}
 	}
 
-	return
+	return ret
 }

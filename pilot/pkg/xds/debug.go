@@ -25,6 +25,8 @@ import (
 	"time"
 
 	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
@@ -37,9 +39,9 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collection"
-	"istio.io/istio/pkg/config/schema/resource"
-	"istio.io/istio/pkg/kube/inject"
+	"istio.io/pkg/log"
 )
 
 var indexTmpl = template.Must(template.New("index").Parse(`<html>
@@ -86,9 +88,10 @@ var indexTmpl = template.Must(template.New("index").Parse(`<html>
 
 // AdsClient defines the data that is displayed on "/adsz" endpoint.
 type AdsClient struct {
-	ConnectionID string    `json:"connectionId"`
-	ConnectedAt  time.Time `json:"connectedAt"`
-	PeerAddress  string    `json:"address"`
+	ConnectionID string              `json:"connectionId"`
+	ConnectedAt  time.Time           `json:"connectedAt"`
+	PeerAddress  string              `json:"address"`
+	Watches      map[string][]string `json:"watches"`
 }
 
 // AdsClients is collection of AdsClient connected to this Istiod.
@@ -120,7 +123,7 @@ type SyncedVersions struct {
 }
 
 // InitDebug initializes the debug handlers and adds a debug in-memory registry.
-func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controller, enableProfiling bool, webhook *inject.Webhook) {
+func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controller, enableProfiling bool, fetchWebhook func() string) {
 	// For debugging and load testing v2 we add an memory registry.
 	s.MemRegistry = memory.NewServiceDiscovery(nil)
 	s.MemRegistry.EDSUpdater = s
@@ -132,6 +135,15 @@ func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controll
 		ServiceDiscovery: s.MemRegistry,
 		Controller:       s.MemRegistry.Controller,
 	})
+	s.AddDebugHandlers(mux, enableProfiling, fetchWebhook)
+}
+
+func (s *DiscoveryServer) AddDebugHandlers(mux *http.ServeMux, enableProfiling bool, webhook func() string) {
+	// Debug handlers on HTTP ports are added for backward compatibility.
+	// They will be exposed on XDS-over-TLS in future releases.
+	if !features.EnableDebugOnHTTP {
+		return
+	}
 
 	if enableProfiling {
 		s.addDebugHandler(mux, "/debug/pprof/", "Displays pprof index", pprof.Index)
@@ -143,7 +155,12 @@ func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controll
 
 	mux.HandleFunc("/debug", s.Debug)
 
+	if features.EnableAdminEndpoints {
+		s.addDebugHandler(mux, "/debug/force_disconnect", "Disconnects a proxy from this Pilot", s.ForceDisconnect)
+	}
+
 	s.addDebugHandler(mux, "/debug/edsz", "Status and debug interface for EDS", s.Edsz)
+	s.addDebugHandler(mux, "/debug/ndsz", "Status and debug interface for NDS", s.Ndsz)
 	s.addDebugHandler(mux, "/debug/adsz", "Status and debug interface for ADS", s.adsz)
 	s.addDebugHandler(mux, "/debug/adsz?push=true", "Initiates push of the current state to all connected endpoints", s.adsz)
 
@@ -153,6 +170,7 @@ func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controll
 	s.addDebugHandler(mux, "/debug/registryz", "Debug support for registry", s.registryz)
 	s.addDebugHandler(mux, "/debug/endpointz", "Debug support for endpoints", s.endpointz)
 	s.addDebugHandler(mux, "/debug/endpointShardz", "Info about the endpoint shards", s.endpointShardz)
+	s.addDebugHandler(mux, "/debug/cachez", "Info about the internal XDS caches", s.cachez)
 	s.addDebugHandler(mux, "/debug/configz", "Debug support for config", s.configz)
 	s.addDebugHandler(mux, "/debug/resourcesz", "Debug support for watched resources", s.resourcez)
 	s.addDebugHandler(mux, "/debug/instancesz", "Debug support for service instances", s.instancesz)
@@ -162,6 +180,7 @@ func (s *DiscoveryServer) InitDebug(mux *http.ServeMux, sctl *aggregate.Controll
 	s.addDebugHandler(mux, "/debug/push_status", "Last PushContext Details", s.PushStatusHandler)
 
 	s.addDebugHandler(mux, "/debug/inject", "Active inject template", s.InjectTemplateHandler(webhook))
+	s.addDebugHandler(mux, "/debug/mesh", "Active mesh config", s.MeshHandler)
 }
 
 func (s *DiscoveryServer) addDebugHandler(mux *http.ServeMux, path string, help string,
@@ -236,6 +255,18 @@ func (s *DiscoveryServer) endpointShardz(w http.ResponseWriter, req *http.Reques
 	_, _ = w.Write(out)
 }
 
+func (s *DiscoveryServer) cachez(w http.ResponseWriter, req *http.Request) {
+	keys := s.Cache.Keys()
+	sort.Strings(keys)
+	bytes, err := json.Marshal(keys)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "unable to marshal syncedVersion information: %v", err)
+		return
+	}
+	_, _ = w.Write(bytes)
+}
+
 // Endpoint debugging
 func (s *DiscoveryServer) endpointz(w http.ResponseWriter, req *http.Request) {
 	_ = req.ParseForm()
@@ -245,10 +276,7 @@ func (s *DiscoveryServer) endpointz(w http.ResponseWriter, req *http.Request) {
 		svc, _ := s.Env.ServiceDiscovery.Services()
 		for _, ss := range svc {
 			for _, p := range ss.Ports {
-				all, err := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port, nil)
-				if err != nil {
-					return
-				}
+				all := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port, nil)
 				for _, svc := range all {
 					_, _ = fmt.Fprintf(w, "%s:%s %s:%d %v %s\n", ss.Hostname,
 						p.Name, svc.Endpoint.Address, svc.Endpoint.EndpointPort, svc.Endpoint.Labels,
@@ -263,10 +291,7 @@ func (s *DiscoveryServer) endpointz(w http.ResponseWriter, req *http.Request) {
 	_, _ = fmt.Fprint(w, "[\n")
 	for _, ss := range svc {
 		for _, p := range ss.Ports {
-			all, err := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port, nil)
-			if err != nil {
-				return
-			}
+			all := s.Env.ServiceDiscovery.InstancesByPort(ss, p.Port, nil)
 			_, _ = fmt.Fprintf(w, "\n{\"svc\": \"%s:%s\", \"ep\": [\n", ss.Hostname, p.Name)
 			for _, svc := range all {
 				b, err := json.MarshalIndent(svc, "  ", "  ")
@@ -340,7 +365,7 @@ func (s *DiscoveryServer) getResourceVersion(nonce, key string, cache map[string
 	configVersion := nonce[:VersionLen]
 	result, ok := cache[configVersion]
 	if !ok {
-		lookupResult, err := s.Env.IstioConfigStore.GetResourceAtVersion(configVersion, key)
+		lookupResult, err := s.Env.GetLedger().GetPreviousValue(configVersion, key)
 		if err != nil {
 			adsLog.Errorf("Unable to retrieve resource %s at version %s: %v", key, configVersion, err)
 			lookupResult = ""
@@ -354,7 +379,7 @@ func (s *DiscoveryServer) getResourceVersion(nonce, key string, cache map[string
 }
 
 type kubernetesConfig struct {
-	model.Config
+	config.Config
 }
 
 func (k kubernetesConfig) MarshalJSON() ([]byte, error) {
@@ -388,7 +413,7 @@ func (s *DiscoveryServer) configz(w http.ResponseWriter, req *http.Request) {
 // Resource debugging.
 func (s *DiscoveryServer) resourcez(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Add("Content-Type", "application/json")
-	schemas := []resource.GroupVersionKind{}
+	schemas := []config.GroupVersionKind{}
 	s.Env.Schemas().ForEach(func(schema collection.Schema) bool {
 		schemas = append(schemas, schema.Resource().GroupVersionKind())
 		return false
@@ -439,7 +464,17 @@ func (s *DiscoveryServer) adsz(w http.ResponseWriter, req *http.Request) {
 			ConnectionID: c.ConID,
 			ConnectedAt:  c.Connect,
 			PeerAddress:  c.PeerAddr,
+			Watches:      map[string][]string{},
 		}
+		c.proxy.RLock()
+		for k, wr := range c.proxy.WatchedResources {
+			r := wr.ResourceNames
+			if r == nil {
+				r = []string{}
+			}
+			adsClient.Watches[k] = r
+		}
+		c.proxy.RUnlock()
 		adsClients.Connected = append(adsClients.Connected, adsClient)
 	}
 	if b, err := json.MarshalIndent(adsClients, "  ", "  "); err == nil {
@@ -534,16 +569,49 @@ func (s *DiscoveryServer) configDump(conn *Connection) (*adminapi.ConfigDump, er
 		}
 	}
 
+	secretsDump := &adminapi.SecretsConfigDump{}
+	if s.Generators[v3.SecretType] != nil {
+		secrets := s.Generators[v3.SecretType].Generate(conn.proxy, s.globalPushContext(), conn.Watched(v3.SecretType), nil)
+		if len(secrets) > 0 {
+			for _, secretAny := range secrets {
+				secret := &tls.Secret{}
+				if err := ptypes.UnmarshalAny(secretAny, secret); err != nil {
+					log.Warnf("failed to unmarshal secret: %v", err)
+				}
+				if secret.GetTlsCertificate() != nil {
+					secret.GetTlsCertificate().PrivateKey = &core.DataSource{
+						Specifier: &core.DataSource_InlineBytes{
+							InlineBytes: []byte("[redacted]"),
+						},
+					}
+				}
+				secretsDump.DynamicActiveSecrets = append(secretsDump.DynamicActiveSecrets, &adminapi.SecretsConfigDump_DynamicSecret{
+					Name:   secret.Name,
+					Secret: util.MessageToAny(secret),
+				})
+			}
+		}
+	}
+
 	bootstrapAny := util.MessageToAny(&adminapi.BootstrapConfigDump{})
+	scopedRoutesAny := util.MessageToAny(&adminapi.ScopedRoutesConfigDump{})
 	// The config dump must have all configs with connections specified in
 	// https://www.envoyproxy.io/docs/envoy/latest/api-v2/admin/v2alpha/config_dump.proto
-	configDump := &adminapi.ConfigDump{Configs: []*any.Any{bootstrapAny, clustersAny, listenersAny, routeConfigAny}}
+	configDump := &adminapi.ConfigDump{
+		Configs: []*any.Any{
+			bootstrapAny,
+			clustersAny, listenersAny,
+			scopedRoutesAny,
+			routeConfigAny,
+			util.MessageToAny(secretsDump),
+		},
+	}
 	return configDump, nil
 }
 
 // InjectTemplateHandler dumps the injection template
 // Replaces dumping the template at startup.
-func (s *DiscoveryServer) InjectTemplateHandler(webhook *inject.Webhook) func(http.ResponseWriter, *http.Request) {
+func (s *DiscoveryServer) InjectTemplateHandler(webhook func() string) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, req *http.Request) {
 		// TODO: we should split the inject template into smaller modules (separate one for dump core, etc),
 		// and allow pods to select which patches will be selected. When this happen, this should return
@@ -553,7 +621,14 @@ func (s *DiscoveryServer) InjectTemplateHandler(webhook *inject.Webhook) func(ht
 			return
 		}
 
-		_, _ = w.Write([]byte(webhook.Config.Template))
+		_, _ = w.Write([]byte(webhook()))
+	}
+}
+
+// MeshHandler dumps the mesh config
+func (s *DiscoveryServer) MeshHandler(w http.ResponseWriter, r *http.Request) {
+	if err := (&jsonpb.Marshaler{Indent: "  "}).Marshal(w, s.Env.Mesh()); err != nil {
+		w.WriteHeader(500)
 	}
 }
 
@@ -601,6 +676,43 @@ func (s *DiscoveryServer) Debug(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(200)
 }
 
+// Ndsz implements a status and debug interface for NDS.
+// It is mapped to /debug/Ndsz on the monitor port (15014).
+func (s *DiscoveryServer) Ndsz(w http.ResponseWriter, req *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+
+	if req.Form.Get("push") != "" {
+		AdsPushAll(s)
+	}
+	var con *Connection
+	if proxyID := req.URL.Query().Get("proxyID"); proxyID != "" {
+		con = s.getProxyConnection(proxyID)
+		// We can't guarantee the Pilot we are connected to has a connection to the proxy we requested
+		// There isn't a great way around this, but for debugging purposes its suitable to have the caller retry.
+		if con == nil {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("Proxy not connected to this Pilot instance. It may be connected to another instance."))
+			return
+		}
+	} else {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("You must provide a proxyID in the query string"))
+		return
+	}
+	if _, err := w.Write([]byte("[")); err != nil {
+		return
+	}
+
+	if s.Generators[v3.NameTableType] != nil {
+		nds := s.Generators[v3.NameTableType].Generate(con.proxy, s.globalPushContext(), nil, nil)
+		if len(nds) == 0 {
+			return
+		}
+		jsonm := &jsonpb.Marshaler{Indent: "  "}
+		_ = jsonm.Marshal(w, nds[0])
+	}
+}
+
 // Edsz implements a status and debug interface for EDS.
 // It is mapped to /debug/edsz on the monitor port (15014).
 func (s *DiscoveryServer) Edsz(w http.ResponseWriter, req *http.Request) {
@@ -642,6 +754,26 @@ func (s *DiscoveryServer) Edsz(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	_, _ = fmt.Fprintln(w, "]")
+}
+
+func (s *DiscoveryServer) ForceDisconnect(w http.ResponseWriter, req *http.Request) {
+	var con *Connection
+	if proxyID := req.URL.Query().Get("proxyID"); proxyID != "" {
+		con = s.getProxyConnection(proxyID)
+		// We can't guarantee the Pilot we are connected to has a connection to the proxy we requested
+		// There isn't a great way around this, but for debugging purposes its suitable to have the caller retry.
+		if con == nil {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("Proxy not connected to this Pilot instance. It may be connected to another instance."))
+			return
+		}
+	} else {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("You must provide a proxyID in the query string"))
+		return
+	}
+	con.Stop()
+	_, _ = w.Write([]byte("OK"))
 }
 
 func (s *DiscoveryServer) getProxyConnection(proxyID string) *Connection {

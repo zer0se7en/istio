@@ -40,12 +40,7 @@ type operatorInitArgs struct {
 
 func addOperatorInitFlags(cmd *cobra.Command, args *operatorInitArgs) {
 	hub, tag := buildversion.DockerInfo.Hub, buildversion.DockerInfo.Tag
-	if hub == "" {
-		hub = "gcr.io/istio-testing"
-	}
-	if tag == "" {
-		tag = "latest"
-	}
+
 	cmd.PersistentFlags().StringVarP(&args.inFilename, "filename", "f", "", filenameFlagHelpStr)
 	cmd.PersistentFlags().StringVarP(&args.kubeConfigPath, "kubeconfig", "c", "", KubeConfigFlagHelpStr)
 	cmd.PersistentFlags().StringVar(&args.context, "context", "", ContextFlagHelpStr)
@@ -85,10 +80,15 @@ func operatorInit(args *rootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
 	// Error here likely indicates Deployment is missing. If some other K8s error, we will hit it again later.
 	already, _ := isControllerInstalled(clientset, oiArgs.common.operatorNamespace, oiArgs.common.revision)
 	if already {
-		l.LogAndPrintf("Operator controller is already installed in %s namespace, updating.", oiArgs.common.operatorNamespace)
+		l.LogAndPrintf("Operator controller is already installed in %s namespace.", oiArgs.common.operatorNamespace)
+		l.LogAndPrintf("Upgrading operator controller in namespace: %s using image: %s/operator:%s",
+			oiArgs.common.operatorNamespace, oiArgs.common.hub, oiArgs.common.tag)
+	} else {
+		l.LogAndPrintf("Installing operator controller in namespace: %s using image: %s/operator:%s",
+			oiArgs.common.operatorNamespace, oiArgs.common.hub, oiArgs.common.tag)
 	}
 
-	l.LogAndPrintf("Using operator Deployment image: %s/operator:%s", oiArgs.common.hub, oiArgs.common.tag)
+	l.LogAndPrintf("Operator controller will watch namespaces: %s", oiArgs.common.watchedNamespaces)
 
 	vals, mstr, err := renderOperatorManifest(args, &oiArgs.common)
 	if err != nil {
@@ -123,7 +123,7 @@ func operatorInit(args *rootArgs, oiArgs *operatorInitArgs, l clog.Logger) {
 	}
 
 	if customResource != "" {
-		if err := createNamespace(clientset, istioNamespace); err != nil {
+		if err := createNamespace(clientset, istioNamespace, ""); err != nil {
 			l.LogAndFatal(err)
 
 		}

@@ -294,16 +294,17 @@ func ParseK8sObjectsFromYAMLManifestFailOption(manifest string, failOnError bool
 }
 
 func removeNonYAMLLines(yms string) string {
-	out := ""
+	var b strings.Builder
 	for _, s := range strings.Split(yms, "\n") {
 		if strings.HasPrefix(s, "#") {
 			continue
 		}
-		out += s + "\n"
+		b.WriteString(s)
+		b.WriteString("\n")
 	}
 
 	// helm charts sometimes emits blank objects with just a "disabled" comment.
-	return strings.TrimSpace(out)
+	return strings.TrimSpace(b.String())
 }
 
 // YAMLManifest returns a YAML representation of K8sObjects os.
@@ -379,6 +380,11 @@ func (o *K8sObject) Valid() bool {
 		return false
 	}
 	return true
+}
+
+// FullName returns namespace/name of K8s object
+func (o *K8sObject) FullName() string {
+	return fmt.Sprintf("%s/%s", o.Namespace, o.Name)
 }
 
 // Equal returns true if o and other are both valid and equal to each other.

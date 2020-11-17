@@ -15,11 +15,11 @@ template: |
     args:
     - istio-iptables
     - "-p"
-    - 15001
+    - "15001"
     - "-z"
     - "15006"
     - "-u"
-    - 1337
+    - "1337"
     - "-m"
     - "{{ annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode }}"
     - "-i"
@@ -58,11 +58,30 @@ template: |
       value: "{{ $value }}"
     {{- end }}
   {{- end }}
-  {{- if .Values.global.proxy_init.resources }}
     resources:
-      {{ toYaml .Values.global.proxy_init.resources | indent 4 }}
+  {{- if or (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit`) }}
+    {{- if or (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory`) }}
+      requests:
+        {{ if (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU`) -}}
+        cpu: "{{ index .ObjectMeta.Annotations `sidecar.istio.io/proxyCPU` }}"
+        {{ end }}
+        {{ if (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory`) -}}
+        memory: "{{ index .ObjectMeta.Annotations `sidecar.istio.io/proxyMemory` }}"
+        {{ end }}
+    {{- end }}
+    {{- if or (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit`) (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit`) }}
+      limits:
+        {{ if (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit`) -}}
+        cpu: "{{ index .ObjectMeta.Annotations `sidecar.istio.io/proxyCPULimit` }}"
+        {{ end }}
+        {{ if (isset .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit`) -}}
+        memory: "{{ index .ObjectMeta.Annotations `sidecar.istio.io/proxyMemoryLimit` }}"
+        {{ end }}
+    {{- end }}
   {{- else }}
-    resources: {}
+    {{- if .Values.global.proxy.resources }}
+      {{ toYaml .Values.global.proxy.resources | indent 4 }}
+    {{- end }}
   {{- end }}
     securityContext:
       allowPrivilegeEscalation: {{ .Values.global.proxy.privileged }}
@@ -141,9 +160,6 @@ template: |
     - --proxyComponentLogLevel={{ annotation .ObjectMeta `sidecar.istio.io/componentLogLevel` .Values.global.proxy.componentLogLevel}}
   {{- if .Values.global.sts.servicePort }}
     - --stsPort={{ .Values.global.sts.servicePort }}
-  {{- end }}
-  {{- if .Values.global.trustDomain }}
-    - --trust-domain={{ .Values.global.trustDomain }}
   {{- end }}
   {{- if .Values.global.logAsJson }}
     - --log_as_json
@@ -235,7 +251,7 @@ template: |
     {{ end }}
     {{- if .DeploymentMeta.Name }}
     - name: ISTIO_META_WORKLOAD_NAME
-      value: {{ .DeploymentMeta.Name }}
+      value: "{{ .DeploymentMeta.Name }}"
     {{ end }}
     {{- if and .TypeMeta.APIVersion .DeploymentMeta.Name }}
     - name: ISTIO_META_OWNER
@@ -248,9 +264,13 @@ template: |
     {{- if .Values.global.meshID }}
     - name: ISTIO_META_MESH_ID
       value: "{{ .Values.global.meshID }}"
-    {{- else if .Values.global.trustDomain }}
+    {{- else if (valueOrDefault .MeshConfig.TrustDomain .Values.global.trustDomain) }}
     - name: ISTIO_META_MESH_ID
-      value: "{{ .Values.global.trustDomain }}"
+      value: "{{ (valueOrDefault .MeshConfig.TrustDomain .Values.global.trustDomain) }}"
+    {{- end }}
+    {{- with (valueOrDefault .MeshConfig.TrustDomain .Values.global.trustDomain)  }}
+    - name: TRUST_DOMAIN
+      value: "{{ . }}"
     {{- end }}
     {{- if and (eq .Values.global.proxy.tracer "datadog") (isset .ObjectMeta.Annotations `apm.datadoghq.com/env`) }}
     {{- range $key, $value := fromJSON (index .ObjectMeta.Annotations `apm.datadoghq.com/env`) }}
@@ -270,6 +290,7 @@ template: |
         port: 15021
       initialDelaySeconds: {{ annotation .ObjectMeta `readiness.status.sidecar.istio.io/initialDelaySeconds` .Values.global.proxy.readinessInitialDelaySeconds }}
       periodSeconds: {{ annotation .ObjectMeta `readiness.status.sidecar.istio.io/periodSeconds` .Values.global.proxy.readinessPeriodSeconds }}
+      timeoutSeconds: 3
       failureThreshold: {{ annotation .ObjectMeta `readiness.status.sidecar.istio.io/failureThreshold` .Values.global.proxy.readinessFailureThreshold }}
     {{ end -}}
     securityContext:
@@ -416,13 +437,6 @@ template: |
     secret:
       optional: true
       secretName: lightstep.cacert
-  {{- end }}
-  {{- if .Values.global.podDNSSearchNamespaces }}
-  dnsConfig:
-    searches:
-      {{- range .Values.global.podDNSSearchNamespaces }}
-      - {{ render . }}
-      {{- end }}
   {{- end }}
   podRedirectAnnot:
   {{- if and (.Values.istio_cni.enabled) (not .Values.istio_cni.chained) }}

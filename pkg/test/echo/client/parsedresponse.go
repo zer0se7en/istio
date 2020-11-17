@@ -25,6 +25,7 @@ import (
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/echo/common/response"
 	"istio.io/istio/pkg/test/echo/proto"
+	"istio.io/istio/pkg/test/framework/resource"
 )
 
 var (
@@ -134,6 +135,23 @@ func (r ParsedResponses) CheckOKOrFail(t test.Failer) ParsedResponses {
 	return r
 }
 
+func (r ParsedResponses) CheckCode(expected string) error {
+	return r.Check(func(i int, response *ParsedResponse) error {
+		if response.Code != expected {
+			return fmt.Errorf("expected response code %s, got %q", expected, response.Code)
+		}
+		return nil
+	})
+}
+
+func (r ParsedResponses) CheckCodeOrFail(t test.Failer, expected string) ParsedResponses {
+	t.Helper()
+	if err := r.CheckCode(expected); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 func (r ParsedResponses) CheckHost(expected string) error {
 	return r.Check(func(i int, response *ParsedResponse) error {
 		if response.Host != expected {
@@ -169,6 +187,58 @@ func (r ParsedResponses) CheckPortOrFail(t test.Failer, expected int) ParsedResp
 	return r
 }
 
+func (r ParsedResponses) clusterDistribution() map[string]int {
+	hits := map[string]int{}
+	for _, rr := range r {
+		hits[rr.Cluster]++
+	}
+	return hits
+}
+
+// CheckReachedClusters returns an error if there wasn't at least one response from each of the given clusters.
+// This can be used in combination with echo.Instances.Clusters(), for example:
+//     echoA[0].CallOrFail(t, ...).CheckReachedClusters(echoB.Clusters())
+func (r ParsedResponses) CheckReachedClusters(clusters resource.Clusters) error {
+	hits := r.clusterDistribution()
+	exp := map[string]struct{}{}
+	for _, expCluster := range clusters {
+		exp[expCluster.Name()] = struct{}{}
+		if hits[expCluster.Name()] == 0 {
+			return fmt.Errorf("did not reach all of %v, got %v", clusters, hits)
+		}
+	}
+	for hitCluster := range hits {
+		if _, ok := exp[hitCluster]; !ok {
+			return fmt.Errorf("reached cluster not in %v, got %v", clusters, hits)
+		}
+	}
+	return nil
+}
+
+// CheckEqualClusterTraffic checks that traffic was equally distributed across the given clusters, allowing some percent error.
+// For example, with 100 requests and 20 percent error, each cluster must given received 20±4 responses. Only the passed
+// in clusters will be validated.
+func (r ParsedResponses) CheckEqualClusterTraffic(clusters resource.Clusters, precisionPct int) error {
+	clusterHits := r.clusterDistribution()
+	expected := len(r) / len(clusters)
+	precision := int(float32(expected) * (float32(precisionPct) / 100))
+	for _, hits := range clusterHits {
+		if !almostEquals(hits, expected, precision) {
+			return fmt.Errorf("requests were not equally distributed across clusters: %v", clusterHits)
+		}
+	}
+	return nil
+}
+
+func almostEquals(a, b, precision int) bool {
+	upper := a + precision
+	lower := a - precision
+	if b < lower || b > upper {
+		return false
+	}
+	return true
+}
+
 func (r ParsedResponses) CheckCluster(expected string) error {
 	return r.Check(func(i int, response *ParsedResponse) error {
 		if response.Cluster != expected {
@@ -195,6 +265,17 @@ func (r ParsedResponses) Count(text string) int {
 	return count
 }
 
+// Match returns a subset of ParsedResponses that match the given predicate.
+func (r ParsedResponses) Match(f func(r *ParsedResponse) bool) ParsedResponses {
+	var matched []*ParsedResponse
+	for _, rr := range r {
+		if f(rr) {
+			matched = append(matched, rr)
+		}
+	}
+	return matched
+}
+
 func (r ParsedResponses) String() string {
 	out := ""
 	for i, resp := range r {
@@ -203,7 +284,7 @@ func (r ParsedResponses) String() string {
 	return out
 }
 
-func parseForwardedResponse(resp *proto.ForwardEchoResponse) ParsedResponses {
+func ParseForwardedResponse(resp *proto.ForwardEchoResponse) ParsedResponses {
 	responses := make([]*ParsedResponse, len(resp.Output))
 	for i, output := range resp.Output {
 		responses[i] = parseResponse(output)

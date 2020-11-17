@@ -16,25 +16,33 @@ package xds_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
-	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	"github.com/golang/protobuf/proto"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"google.golang.org/genproto/googleapis/rpc/status"
 
 	mesh "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/util/sets"
 	"istio.io/istio/pilot/pkg/xds"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
+	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/adsc"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	istioagent "istio.io/istio/pkg/istio-agent"
 	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -72,7 +80,7 @@ func TestAgent(t *testing.T) {
 	defer tearDown()
 
 	// TODO: when authz is implemented, verify labels are checked.
-	cert, key, err := bs.CA.GenKeyCert([]string{"spiffe://cluster.local/fake.test"}, 1*time.Hour)
+	cert, key, err := bs.CA.GenKeyCert([]string{spiffe.Identity{"cluster.local", "test", "sa"}.String()}, 1*time.Hour, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +100,7 @@ func TestAgent(t *testing.T) {
 			ControlPlaneAuthPolicy: mesh.AuthenticationPolicy_MUTUAL_TLS,
 		}, &istioagent.AgentConfig{
 			// Enable proxy - off by default, will be XDS_LOCAL env in install.
-			LocalXDSAddr: "127.0.0.1:15002",
+			LocalXDSGeneratorListenAddress: "127.0.0.1:15002",
 		}, &security.Options{
 			PilotCertProvider: "custom",
 			ClusterID:         "kubernetes",
@@ -102,28 +110,37 @@ func TestAgent(t *testing.T) {
 		// TODO: add a test for cert-based config.
 		// TODO: add a test for JWT-based ( using some mock OIDC in Istiod)
 		sa.WorkloadSecrets = creds
+		sa.RootCert = creds.RootCert
 		_, err = sa.Start(true, "test")
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// connect to the local XDS proxy - it's using a transient port.
-		ldsr, err := adsc.Dial(sa.LocalXDSListener.Addr().String(), "",
+		ldsr, err := adsc.New(sa.GetLocalXDSGeneratorListener().Addr().String(),
 			&adsc.Config{
 				IP:        "10.11.10.1",
 				Namespace: "test",
-				Watch: []string{
-					v3.ClusterType,
-					collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String()},
+				RootCert:  creds.RootCert,
+				InitialDiscoveryRequests: []*discovery.DiscoveryRequest{
+					{TypeUrl: v3.ClusterType},
+					{TypeUrl: collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String()},
+				},
 			})
 		if err != nil {
 			t.Fatal("Failed to connect", err)
 		}
 		defer ldsr.Close()
+		if err := ldsr.Run(); err != nil {
+			t.Fatal("ADSC: failed running ", err)
+		}
 
-		_, err = ldsr.WaitVersion(5*time.Second, collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String(), "")
+		r, err := ldsr.WaitVersion(5*time.Second, collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String(), "")
 		if err != nil {
 			t.Fatal(err)
+		}
+		if len(r.Resources) == 0 {
+			t.Fatalf("Got no resources")
 		}
 	})
 
@@ -136,15 +153,16 @@ func TestAgent(t *testing.T) {
 // testAdscTLS tests that ADSC helper can connect using TLS to Istiod
 func testAdscTLS(t *testing.T, creds security.SecretManager) {
 	// connect to the local XDS proxy - it's using a transient port.
-	ldsr, err := adsc.Dial(util.MockPilotSGrpcAddr, "",
+	ldsr, err := adsc.New(util.MockPilotSGrpcAddr,
 		&adsc.Config{
-			IP:        "10.11.10.1",
-			Namespace: "test",
-			Secrets:   creds,
-			Watch: []string{
-				v3.ClusterType,
-				xds.TypeURLConnections,
-				collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String()},
+			IP:            "10.11.10.1",
+			Namespace:     "test",
+			SecretManager: creds,
+			InitialDiscoveryRequests: []*discovery.DiscoveryRequest{
+				{TypeUrl: v3.ClusterType},
+				{TypeUrl: xds.TypeURLConnections},
+				{TypeUrl: collections.IstioNetworkingV1Alpha3Serviceentries.Resource().GroupVersionKind().String()},
+			},
 		})
 	if err != nil {
 		t.Fatal("Failed to connect", err)
@@ -193,148 +211,72 @@ func TestInternalEvents(t *testing.T) {
 
 func TestAdsReconnectAfterRestart(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
-	err := sendEDSReq([]string{"fake-cluster"}, sidecarID(app3Ip, "app3"), "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil {
-		t.Fatal("Expected EDS response, but go nil")
-	}
-	if len(res.Resources) != 1 || res.TypeUrl != v3.EndpointType {
-		t.Fatalf("Expected one EDS resource, but got %v %s resources", len(res.Resources), res.TypeUrl)
-	}
 
+	ads := s.ConnectADS().WithType(v3.EndpointType)
+	res := ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{"fake-cluster"}})
 	// Close the connection and reconnect
-	_ = adscon.CloseSend()
-	adscon = s.ConnectADS()
+	ads.Cleanup()
 
-	// Connect with empty resources.
-	err = sendEDSReq([]string{}, sidecarID(app3Ip, "app3"), res.VersionInfo, res.Nonce, adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil {
-		t.Fatal("Expected EDS response, but go nil")
-	}
-	if len(res.Resources) != 0 || res.TypeUrl != v3.EndpointType {
-		t.Fatalf("Expected zero EDS resource, but got %v %s resources", len(res.Resources), res.TypeUrl)
-	}
+	ads = s.ConnectADS().WithType(v3.EndpointType)
+
+	// Reconnect with the same resources
+	ads.RequestResponseAck(&discovery.DiscoveryRequest{
+		ResourceNames: []string{"fake-cluster"},
+		ResponseNonce: res.Nonce,
+		VersionInfo:   res.VersionInfo})
 }
 
-// Regression for envoy restart and overlapping connections
-func TestAdsReconnectWithNonce(t *testing.T) {
+func TestAdsUnsubscribe(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
-	err := sendEDSReq([]string{"fake-cluster"}, sidecarID(app3Ip, "app3"), "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	// closes old process and reconnect
-	_ = adscon.CloseSend()
-	adscon = s.ConnectADS()
+	ads := s.ConnectADS().WithType(v3.EndpointType)
+	res := ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{"fake-cluster"}})
 
-	err = sendEDSReqReconnect([]string{"fake-cluster"}, adscon, res)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = sendEDSReq([]string{"fake-cluster"}, sidecarID(app3Ip, "app3"), "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, _ = adsReceive(adscon, 15*time.Second)
-
-	if res == nil {
-		t.Fatal("Expected EDS response, but go nil")
-	}
-	if len(res.Resources) != 1 || res.TypeUrl != v3.EndpointType {
-		t.Fatalf("Expected one EDS resource, but got %v %s resources", len(res.Resources), res.TypeUrl)
-	}
+	ads.Request(&discovery.DiscoveryRequest{
+		ResourceNames: nil,
+		ResponseNonce: res.Nonce,
+		VersionInfo:   res.VersionInfo})
+	ads.ExpectNoResponse()
 }
 
 // Regression for envoy restart and overlapping connections
 func TestAdsReconnect(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
-	err := sendCDSReq(sidecarID(app3Ip, "app3"), adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, _ = adsReceive(adscon, 15*time.Second)
+	ads := s.ConnectADS().WithType(v3.ClusterType)
+	ads.RequestResponseAck(nil)
 
 	// envoy restarts and reconnects
-	adscon2 := s.ConnectADS()
-	err = sendCDSReq(sidecarID(app3Ip, "app3"), adscon2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = adsReceive(adscon2, 15*time.Second)
+	ads2 := s.ConnectADS().WithType(v3.ClusterType)
+	ads2.RequestResponseAck(nil)
 
 	// closes old process
-	adscon.CloseSend()
+	ads.Cleanup()
 
-	time.Sleep(1 * time.Second)
-
-	// event happens
+	// event happens, expect push to the remaining connection
 	xds.AdsPushAll(s.Discovery)
-
-	m, err := adsReceive(adscon2, 3*time.Second)
-	if err != nil {
-		t.Fatal("Recv failed", err)
-	}
-	if m == nil {
-		t.Fatal("Expected CDS response, but go nil")
-	}
-	if len(m.Resources) == 0 || m.TypeUrl != v3.ClusterType {
-		t.Fatalf("Expected non zero CDS resources, but got %v %s resources", len(m.Resources), m.TypeUrl)
-	}
+	ads2.ExpectResponse()
 }
 
 func TestAdsClusterUpdate(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
+	ads := s.ConnectADS().WithType(v3.EndpointType)
 
 	version := ""
 	nonce := ""
 	var sendEDSReqAndVerify = func(clusterName string) {
-		err := sendEDSReq([]string{clusterName}, sidecarID("1.1.1.1", "app3"), version, nonce, adscon)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res, err := adsReceive(adscon, 15*time.Second)
+		res := ads.RequestResponseAck(&discovery.DiscoveryRequest{
+			ResourceNames: []string{clusterName},
+			VersionInfo:   version,
+			ResponseNonce: nonce,
+		})
 		version = res.VersionInfo
 		nonce = res.Nonce
-		if err != nil {
-			t.Fatal("Recv failed", err)
+		got := xdstest.MapKeys(xdstest.ExtractLoadAssignments(xdstest.UnmarshalClusterLoadAssignment(t, res.Resources)))
+		if len(got) != 1 {
+			t.Fatalf("expected 1 response, got %v", len(got))
 		}
-
-		if res.TypeUrl != v3.EndpointType {
-			t.Errorf("Expecting %v got %v", v3.EndpointType, res.TypeUrl)
-		}
-		if res.Resources[0].TypeUrl != v3.EndpointType {
-			t.Errorf("Expecting %v got %v", v3.EndpointType, res.Resources[0].TypeUrl)
-		}
-
-		cla, err := getLoadAssignment(res)
-		if err != nil {
-			t.Fatal("Invalid EDS response ", err)
-		}
-		if cla.ClusterName != clusterName {
-			t.Error(fmt.Sprintf("Expecting %s got ", clusterName), cla.ClusterName)
+		if got[0] != clusterName {
+			t.Fatalf("expected cluster %v got %v", clusterName, got[0])
 		}
 	}
 
@@ -425,18 +367,21 @@ func TestAdsPushScoping(t *testing.T) {
 		}})
 	}
 
-	addVirtualService := func(i int, hosts ...string) {
-		if _, err := s.Store.Create(model.Config{
-			ConfigMeta: model.ConfigMeta{
+	addVirtualService := func(i int, hosts []string, dest string) {
+		if _, err := s.Store().Create(config.Config{
+			Meta: config.Meta{
 				GroupVersionKind: gvk.VirtualService,
 				Name:             fmt.Sprintf("vs%d", i), Namespace: model.IstioDefaultConfigNamespace},
 			Spec: &networking.VirtualService{
 				Hosts: hosts,
-				Http: []*networking.HTTPRoute{{Redirect: &networking.HTTPRedirect{
-					Uri:          "example.org",
-					Authority:    "some-authority.default.svc.cluster.local",
-					RedirectCode: 308,
-				}}},
+				Http: []*networking.HTTPRoute{{
+					Name: "dest-foo",
+					Route: []*networking.HTTPRouteDestination{{
+						Destination: &networking.Destination{
+							Host: dest,
+						},
+					}},
+				}},
 				ExportTo: nil,
 			},
 		}); err != nil {
@@ -444,11 +389,11 @@ func TestAdsPushScoping(t *testing.T) {
 		}
 	}
 	removeVirtualService := func(i int) {
-		s.Store.Delete(gvk.VirtualService, fmt.Sprintf("vs%d", i), model.IstioDefaultConfigNamespace)
+		s.Store().Delete(gvk.VirtualService, fmt.Sprintf("vs%d", i), model.IstioDefaultConfigNamespace)
 	}
 	addDestinationRule := func(i int, host string) {
-		if _, err := s.Store.Create(model.Config{
-			ConfigMeta: model.ConfigMeta{
+		if _, err := s.Store().Create(config.Config{
+			Meta: config.Meta{
 				GroupVersionKind: gvk.DestinationRule,
 				Name:             fmt.Sprintf("dr%d", i), Namespace: model.IstioDefaultConfigNamespace},
 			Spec: &networking.DestinationRule{
@@ -460,7 +405,7 @@ func TestAdsPushScoping(t *testing.T) {
 		}
 	}
 	removeDestinationRule := func(i int) {
-		s.Store.Delete(gvk.DestinationRule, fmt.Sprintf("dr%d", i), model.IstioDefaultConfigNamespace)
+		s.Store().Delete(gvk.DestinationRule, fmt.Sprintf("dr%d", i), model.IstioDefaultConfigNamespace)
 	}
 
 	sc := &networking.Sidecar{
@@ -470,8 +415,8 @@ func TestAdsPushScoping(t *testing.T) {
 			},
 		},
 	}
-	if _, err := s.Store.Create(model.Config{
-		ConfigMeta: model.ConfigMeta{
+	if _, err := s.Store().Create(config.Config{
+		Meta: config.Meta{
 			GroupVersionKind: gvk.Sidecar,
 			Name:             "sc", Namespace: model.IstioDefaultConfigNamespace},
 		Spec: sc,
@@ -496,6 +441,7 @@ func TestAdsPushScoping(t *testing.T) {
 		vsIndexes []struct {
 			index int
 			hosts []string
+			dest  string
 		}
 		drIndexes []struct {
 			index int
@@ -511,7 +457,7 @@ func TestAdsPushScoping(t *testing.T) {
 			ev:            model.EventAdd,
 			svcIndexes:    []int{4},
 			ns:            model.IstioDefaultConfigNamespace,
-			expectUpdates: []string{"lds"},
+			expectUpdates: []string{v3.ListenerType},
 		}, // then: default 1,2,3,4
 		{
 			desc: "Add instances to a scoped service",
@@ -521,7 +467,7 @@ func TestAdsPushScoping(t *testing.T) {
 				indexes []int
 			}{{fmt.Sprintf("svc%d%s", 4, svcSuffix), []int{1, 2}}},
 			ns:            model.IstioDefaultConfigNamespace,
-			expectUpdates: []string{"eds"},
+			expectUpdates: []string{v3.EndpointType},
 		}, // then: default 1,2,3,4
 		{
 			desc: "Add virtual service to a scoped service",
@@ -529,8 +475,9 @@ func TestAdsPushScoping(t *testing.T) {
 			vsIndexes: []struct {
 				index int
 				hosts []string
-			}{{4, []string{fmt.Sprintf("svc%d%s", 4, svcSuffix)}}},
-			expectUpdates: []string{"lds"},
+				dest  string
+			}{{index: 4, hosts: []string{fmt.Sprintf("svc%d%s", 4, svcSuffix)}, dest: "unknown-svc"}},
+			expectUpdates: []string{v3.ListenerType},
 		},
 		{
 			desc: "Delete virtual service of a scoped service",
@@ -538,8 +485,9 @@ func TestAdsPushScoping(t *testing.T) {
 			vsIndexes: []struct {
 				index int
 				hosts []string
+				dest  string
 			}{{index: 4}},
-			expectUpdates: []string{"lds"},
+			expectUpdates: []string{v3.ListenerType},
 		},
 		{
 			desc: "Add destination rule to a scoped service",
@@ -548,7 +496,7 @@ func TestAdsPushScoping(t *testing.T) {
 				index int
 				host  string
 			}{{4, fmt.Sprintf("svc%d%s", 4, svcSuffix)}},
-			expectUpdates: []string{"cds"},
+			expectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc: "Delete destination rule of a scoped service",
@@ -557,14 +505,14 @@ func TestAdsPushScoping(t *testing.T) {
 				index int
 				host  string
 			}{{index: 4}},
-			expectUpdates: []string{"cds"},
+			expectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc:            "Add a unscoped(name not match) service",
 			ev:              model.EventAdd,
 			svcNames:        []string{"foo.com"},
 			ns:              model.IstioDefaultConfigNamespace,
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		}, // then: default 1,2,3,4, foo.com; ns1: 11
 		{
 			desc: "Add instances to an unscoped service",
@@ -574,14 +522,14 @@ func TestAdsPushScoping(t *testing.T) {
 				indexes []int
 			}{{"foo.com", []int{1, 2}}},
 			ns:              model.IstioDefaultConfigNamespace,
-			unexpectUpdates: []string{"eds"},
+			unexpectUpdates: []string{v3.EndpointType},
 		}, // then: default 1,2,3,4
 		{
 			desc:            "Add a unscoped(ns not match) service",
 			ev:              model.EventAdd,
 			svcIndexes:      []int{11},
 			ns:              ns1,
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		}, // then: default 1,2,3,4, foo.com; ns1: 11
 		{
 			desc: "Add virtual service to an unscoped service",
@@ -589,8 +537,9 @@ func TestAdsPushScoping(t *testing.T) {
 			vsIndexes: []struct {
 				index int
 				hosts []string
-			}{{0, []string{"foo.com"}}},
-			unexpectUpdates: []string{"cds"},
+				dest  string
+			}{{index: 0, hosts: []string{"foo.com"}, dest: "unknown-service"}},
+			unexpectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc: "Delete virtual service of a unscoped service",
@@ -598,8 +547,9 @@ func TestAdsPushScoping(t *testing.T) {
 			vsIndexes: []struct {
 				index int
 				hosts []string
+				dest  string
 			}{{index: 0}},
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc: "Add destination rule to an unscoped service",
@@ -608,7 +558,7 @@ func TestAdsPushScoping(t *testing.T) {
 				index int
 				host  string
 			}{{0, "foo.com"}},
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc: "Delete destination rule of a unscoped service",
@@ -617,28 +567,58 @@ func TestAdsPushScoping(t *testing.T) {
 				index int
 				host  string
 			}{{index: 0}},
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
+		},
+		{
+			desc: "Add virtual service for scoped service with transitively scoped dest svc",
+			ev:   model.EventAdd,
+			vsIndexes: []struct {
+				index int
+				hosts []string
+				dest  string
+			}{{index: 4, hosts: []string{fmt.Sprintf("svc%d%s", 4, svcSuffix)}, dest: "foo.com"}},
+			expectUpdates: []string{v3.ClusterType, v3.EndpointType},
+		},
+		{
+			desc: "Add instances for transitively scoped svc",
+			ev:   model.EventAdd,
+			instIndexes: []struct {
+				name    string
+				indexes []int
+			}{{"foo.com", []int{1, 2}}},
+			ns:            model.IstioDefaultConfigNamespace,
+			expectUpdates: []string{v3.EndpointType},
+		},
+		{
+			desc: "Delete virtual service for scoped service with transitively scoped dest svc",
+			ev:   model.EventDelete,
+			vsIndexes: []struct {
+				index int
+				hosts []string
+				dest  string
+			}{{index: 4}},
+			expectUpdates: []string{v3.ClusterType},
 		},
 		{
 			desc:          "Remove a scoped service",
 			ev:            model.EventDelete,
 			svcIndexes:    []int{4},
 			ns:            model.IstioDefaultConfigNamespace,
-			expectUpdates: []string{"lds"},
+			expectUpdates: []string{v3.ListenerType},
 		}, // then: default 1,2,3, foo.com; ns: 11
 		{
 			desc:            "Remove a unscoped(name not match) service",
 			ev:              model.EventDelete,
 			svcNames:        []string{"foo.com"},
 			ns:              model.IstioDefaultConfigNamespace,
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		}, // then: default 1,2,3; ns1: 11
 		{
 			desc:            "Remove a unscoped(ns not match) service",
 			ev:              model.EventDelete,
 			svcIndexes:      []int{11},
 			ns:              ns1,
-			unexpectUpdates: []string{"cds"},
+			unexpectUpdates: []string{v3.ClusterType},
 		}, // then: default 1,2,3
 	}
 
@@ -666,7 +646,7 @@ func TestAdsPushScoping(t *testing.T) {
 				}
 				if len(c.vsIndexes) > 0 {
 					for _, vsIndex := range c.vsIndexes {
-						addVirtualService(vsIndex.index, vsIndex.hosts...)
+						addVirtualService(vsIndex.index, vsIndex.hosts, vsIndex.dest)
 					}
 				}
 				if len(c.drIndexes) > 0 {
@@ -713,7 +693,7 @@ func TestAdsPushScoping(t *testing.T) {
 
 func TestAdsUpdate(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
+	ads := s.ConnectADS()
 
 	s.Discovery.MemRegistry.AddService("adsupdate.default.svc.cluster.local", &model.Service{
 		Hostname: "adsupdate.default.svc.cluster.local",
@@ -735,37 +715,17 @@ func TestAdsUpdate(t *testing.T) {
 	s.Discovery.MemRegistry.SetEndpoints("adsupdate.default.svc.cluster.local", "default",
 		newEndpointWithAccount("10.2.0.1", "hello-sa", "v1"))
 
-	err := sendEDSReq([]string{"outbound|2080||adsupdate.default.svc.cluster.local"}, sidecarID("1.1.1.1", "app3"), "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
+	cluster := "outbound|2080||adsupdate.default.svc.cluster.local"
+	res := ads.RequestResponseAck(&discovery.DiscoveryRequest{
+		ResourceNames: []string{cluster},
+		TypeUrl:       v3.EndpointType,
+	})
+	eps, f := xdstest.ExtractLoadAssignments(xdstest.UnmarshalClusterLoadAssignment(t, res.GetResources()))[cluster]
+	if !f {
+		t.Fatalf("did not find cluster %v", cluster)
 	}
-
-	res1, err := adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal("Recv failed", err)
-	}
-
-	if res1.TypeUrl != v3.EndpointType {
-		t.Errorf("Expecting %v got %v", v3.EndpointType, res1.TypeUrl)
-	}
-	if res1.Resources[0].TypeUrl != v3.EndpointType {
-		t.Errorf("Expecting %v got %v", v3.EndpointType, res1.Resources[0].TypeUrl)
-	}
-	cla, err := getLoadAssignment(res1)
-	if err != nil {
-		t.Fatal("Invalid EDS response ", err)
-	}
-
-	ep := cla.Endpoints
-	if len(ep) == 0 {
-		t.Fatal("No endpoints")
-	}
-	lbe := ep[0].LbEndpoints
-	if len(lbe) == 0 {
-		t.Fatal("No lb endpoints")
-	}
-	if lbe[0].GetEndpoint().Address.GetSocketAddress().Address != "10.2.0.1" {
-		t.Error("Expecting 10.2.0.1 got ", lbe[0].GetEndpoint().Address.GetSocketAddress().Address)
+	if !reflect.DeepEqual(eps, []string{"10.2.0.1:80"}) {
+		t.Fatalf("expected endpoints [10.2.0.1:80] got %v", eps)
 	}
 
 	_ = s.Discovery.MemRegistry.AddEndpoint("adsupdate.default.svc.cluster.local",
@@ -774,195 +734,231 @@ func TestAdsUpdate(t *testing.T) {
 	// will trigger recompute and push for all clients - including some that may be closing
 	// This reproduced the 'push on closed connection' bug.
 	xds.AdsPushAll(s.Discovery)
-
-	res1, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal("Recv2 failed", err)
-	}
-
-	if res1.TypeUrl != v3.EndpointType {
-		t.Errorf("Expecting %v got %v", v3.EndpointType, res1.TypeUrl)
-	}
-	if res1.Resources[0].TypeUrl != v3.EndpointType {
-		t.Errorf("Expecting %v got %v", v3.EndpointType, res1.Resources[0].TypeUrl)
-	}
-	_, err = getLoadAssignment(res1)
-	if err != nil {
-		t.Fatal("Invalid EDS response ", err)
-	}
+	res1 := ads.ExpectResponse()
+	xdstest.UnmarshalClusterLoadAssignment(t, res1.GetResources())
 }
 
 func TestEnvoyRDSProtocolError(t *testing.T) {
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
-
-	err := sendRDSReq(gatewayID(gatewayIP), []string{routeA}, "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes returned")
-	}
+	ads := s.ConnectADS().WithType(v3.RouteType)
+	ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{routeA}})
 
 	xds.AdsPushAll(s.Discovery)
+	res := ads.ExpectResponse()
 
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) != 1 {
-		t.Fatal("No routes returned")
-	}
-
-	// send empty response and validate no routes are retuned.
-	err = sendRDSReq(gatewayID(gatewayIP), nil, res.VersionInfo, res.Nonce, adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) != 0 {
-		t.Fatalf("No routes expected but got routes %v", len(res.Resources))
-	}
+	// send empty response and validate no response is returned.
+	ads.Request(&discovery.DiscoveryRequest{
+		ResourceNames: nil,
+		VersionInfo:   res.VersionInfo,
+		ResponseNonce: res.Nonce,
+	})
+	ads.ExpectNoResponse()
 
 	// Refresh routes
-	err = sendRDSReq(gatewayID(gatewayIP), []string{routeA, routeB}, res.VersionInfo, res.Nonce, adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ads.Request(&discovery.DiscoveryRequest{
+		ResourceNames: []string{routeA, routeB},
+		VersionInfo:   res.VersionInfo,
+		ResponseNonce: res.Nonce,
+	})
+}
 
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestBlockedPush(t *testing.T) {
+	original := features.EnableFlowControl
+	t.Cleanup(func() {
+		features.EnableFlowControl = original
+	})
+	t.Run("flow control enabled", func(t *testing.T) {
+		features.EnableFlowControl = true
+		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+		ads := s.ConnectADS().WithType(v3.ClusterType)
+		ads.RequestResponseAck(nil)
+		// Send push, get a response but do not ACK it
+		xds.AdsPushAll(s.Discovery)
+		res := ads.ExpectResponse()
 
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes after protocol error")
-	}
+		// Another push results in no response as we are blocked
+		xds.AdsPushAll(s.Discovery)
+		ads.ExpectNoResponse()
+
+		// ACK, unblocking the previous push
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce})
+		res = ads.ExpectResponse()
+
+		// ACK again, ensure we do not response
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce})
+		ads.ExpectNoResponse()
+
+		// request new resources, expect response
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce, ResourceNames: []string{"foo"}})
+		res = ads.ExpectResponse()
+		// request new resources, expect response, even without explicit ACK
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce, ResourceNames: []string{"foo", "bar"}})
+		ads.ExpectResponse()
+	})
+	t.Run("flow control enabled NACK", func(t *testing.T) {
+		log.FindScope("ads").SetOutputLevel(log.DebugLevel)
+		features.EnableFlowControl = true
+		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+		ads := s.ConnectADS().WithType(v3.ClusterType)
+		ads.RequestResponseAck(nil)
+
+		// Send push, get a response and NACK it
+		xds.AdsPushAll(s.Discovery)
+		res := ads.ExpectResponse()
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce, ErrorDetail: &status.Status{Message: "Test request NACK"}})
+
+		// Another push results in a response as we are not blocked (NACK unblocks)
+		xds.AdsPushAll(s.Discovery)
+		ads.ExpectResponse()
+
+		// ACK should not get push
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce})
+		ads.ExpectNoResponse()
+	})
+	t.Run("flow control disabled", func(t *testing.T) {
+		features.EnableFlowControl = false
+		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+		ads := s.ConnectADS().WithType(v3.ClusterType)
+		ads.RequestResponseAck(nil)
+		// Send push, get a response but do not ACK it
+		xds.AdsPushAll(s.Discovery)
+		res := ads.ExpectResponse()
+
+		// Another push results in response as we do not care that we are blocked
+		xds.AdsPushAll(s.Discovery)
+		ads.ExpectResponse()
+
+		// ACK gets no response as we don't have flow control enabled
+		ads.Request(&discovery.DiscoveryRequest{ResponseNonce: res.Nonce})
+		ads.ExpectNoResponse()
+	})
 }
 
 func TestEnvoyRDSUpdatedRouteRequest(t *testing.T) {
+	expectRoutes := func(resp *discovery.DiscoveryResponse, expected ...string) {
+		t.Helper()
+		got := xdstest.MapKeys(xdstest.ExtractRouteConfigurations(xdstest.UnmarshalRouteConfiguration(t, resp.Resources)))
+		if !reflect.DeepEqual(expected, got) {
+			t.Fatalf("expected routes %v got %v", expected, got)
+		}
+	}
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
-	adscon := s.ConnectADS()
-
-	err := sendRDSReq(gatewayID(gatewayIP), []string{routeA}, "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes returned")
-	}
-	route1, err := unmarshallRoute(res.Resources[0].Value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Resources) != 1 || route1.Name != routeA {
-		t.Fatal("Expected only the http.80 route to be returned")
-	}
+	ads := s.ConnectADS().WithType(v3.RouteType)
+	resp := ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{routeA}})
+	expectRoutes(resp, routeA)
 
 	xds.AdsPushAll(s.Discovery)
-
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes returned")
-	}
-	if len(res.Resources) != 1 {
-		t.Fatal("Expected only 1 route to be returned")
-	}
-	route1, err = unmarshallRoute(res.Resources[0].Value)
-	if err != nil || len(res.Resources) != 1 || route1.Name != routeA {
-		t.Fatal("Expected only the http.80 route to be returned")
-	}
+	resp = ads.ExpectResponse()
+	expectRoutes(resp, routeA)
 
 	// Test update from A -> B
-	err = sendRDSReq(gatewayID(gatewayIP), []string{routeB}, "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes returned")
-	}
-	route1, err = unmarshallRoute(res.Resources[0].Value)
-	if err != nil || len(res.Resources) != 1 || route1.Name != routeB {
-		t.Fatal("Expected only the http.80 route to be returned")
-	}
+	resp = ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{routeB}})
+	expectRoutes(resp, routeB)
 
 	// Test update from B -> A, B
-	err = sendRDSReq(gatewayID(gatewayIP), []string{routeA, routeB}, res.VersionInfo, res.Nonce, adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes after protocol error")
-	}
-	if len(res.Resources) != 2 {
-		t.Fatal("Expected 2 routes to be returned")
-	}
-
-	route1, err = unmarshallRoute(res.Resources[0].Value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	route2, err := unmarshallRoute(res.Resources[1].Value)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if (route1.Name == routeA && route2.Name != routeB) || (route2.Name == routeA && route1.Name != routeB) {
-		t.Fatal("Expected http.80 and https.443.http routes to be returned")
-	}
+	resp = ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{routeA, routeB}})
+	expectRoutes(resp, routeA, routeB)
 
 	// Test update from B, B -> A
-
-	err = sendRDSReq(gatewayID(gatewayIP), []string{routeA}, "", "", adscon)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err = adsReceive(adscon, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res == nil || len(res.Resources) == 0 {
-		t.Fatal("No routes returned")
-	}
-	route1, err = unmarshallRoute(res.Resources[0].Value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Resources) != 1 || route1.Name != routeA {
-		t.Fatal("Expected only the http.80 route to be returned")
-	}
+	resp = ads.RequestResponseAck(&discovery.DiscoveryRequest{ResourceNames: []string{routeA}})
+	expectRoutes(resp, routeA)
 }
 
-func unmarshallRoute(value []byte) (*route.RouteConfiguration, error) {
-	route := &route.RouteConfiguration{}
-
-	err := proto.Unmarshal(value, route)
-	if err != nil {
-		return nil, err
+func TestXdsCache(t *testing.T) {
+	makeEndpoint := func(addr []*networking.WorkloadEntry) config.Config {
+		return config.Config{
+			Meta: config.Meta{
+				Name:             "service",
+				Namespace:        "default",
+				GroupVersionKind: gvk.ServiceEntry,
+			},
+			Spec: &networking.ServiceEntry{
+				Hosts: []string{"foo.com"},
+				Ports: []*networking.Port{{
+					Number:   80,
+					Protocol: "HTTP",
+					Name:     "http",
+				}},
+				Resolution: networking.ServiceEntry_STATIC,
+				Endpoints:  addr,
+			},
+		}
 	}
-	return route, nil
+	assertEndpoints := func(a *adsc.ADSC, addr ...string) {
+		t.Helper()
+		got := sets.NewSet(xdstest.ExtractEndpoints(a.GetEndpoints()["outbound|80||foo.com"])...)
+		want := sets.NewSet(addr...)
+
+		if !got.Equals(want) {
+			t.Fatalf("invalid endpoints, got %v want %v", got, addr)
+		}
+	}
+
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
+		Configs: []config.Config{
+			makeEndpoint([]*networking.WorkloadEntry{
+				{Address: "1.2.3.4", Locality: "region/zone"},
+				{Address: "1.2.3.5", Locality: "notmatch"},
+			}),
+		},
+	})
+	ads := s.Connect(&model.Proxy{Locality: &core.Locality{Region: "region"}}, nil, watchAll)
+
+	assertEndpoints(ads, "1.2.3.4:80", "1.2.3.5:80")
+	t.Logf("endpoints: %+v", ads.GetEndpoints())
+
+	if _, err := s.Store().Update(makeEndpoint([]*networking.WorkloadEntry{
+		{Address: "1.2.3.6", Locality: "region/zone"},
+		{Address: "1.2.3.5", Locality: "notmatch"},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ads.Wait(time.Second*5, v3.EndpointType); err != nil {
+		t.Fatal(err)
+	}
+	assertEndpoints(ads, "1.2.3.6:80", "1.2.3.5:80")
+	t.Logf("endpoints: %+v", ads.GetEndpoints())
+
+	ads.WaitClear()
+	if _, err := s.Store().Create(config.Config{
+		Meta: config.Meta{
+			Name:             "service",
+			Namespace:        "default",
+			GroupVersionKind: gvk.DestinationRule,
+		},
+		Spec: &networking.DestinationRule{
+			Host: "foo.com",
+			TrafficPolicy: &networking.TrafficPolicy{
+				OutlierDetection: &networking.OutlierDetection{},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ads.Wait(time.Second*5, v3.EndpointType); err != nil {
+		t.Fatal(err)
+	}
+	assertEndpoints(ads, "1.2.3.6:80", "1.2.3.5:80")
+	found := false
+	for _, ep := range ads.GetEndpoints()["outbound|80||foo.com"].Endpoints {
+		if ep.Priority == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("locality did not update")
+	}
+	t.Logf("endpoints: %+v", ads.GetEndpoints())
+	ads.WaitClear()
+
+	ep := makeEndpoint([]*networking.WorkloadEntry{{Address: "1.2.3.6", Locality: "region/zone"}, {Address: "1.2.3.5", Locality: "notmatch"}})
+	ep.Spec.(*networking.ServiceEntry).Resolution = networking.ServiceEntry_DNS
+	if _, err := s.Store().Update(ep); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ads.Wait(time.Second*5, v3.EndpointType); err != nil {
+		t.Fatal(err)
+	}
+	assertEndpoints(ads)
+	t.Logf("endpoints: %+v", ads.GetEndpoints())
 }
