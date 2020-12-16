@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/fatih/color"
 	appsv1 "k8s.io/api/apps/v1"
 	v1batch "k8s.io/api/batch/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"istio.io/api/label"
 	"istio.io/istio/istioctl/pkg/clioptions"
 	operator_istio "istio.io/istio/operator/pkg/apis/istio"
 	"istio.io/istio/operator/pkg/apis/istio/v1alpha1"
@@ -37,6 +39,7 @@ import (
 	"istio.io/istio/operator/pkg/translate"
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pkg/kube"
 )
 
 var (
@@ -58,6 +61,8 @@ type StatusVerifier struct {
 	controlPlaneOpts clioptions.ControlPlaneOptions
 	logger           clog.Logger
 	iop              *v1alpha1.IstioOperator
+	successMarker    string
+	failureMarker    string
 }
 
 // NewStatusVerifier creates a new instance of post-install verifier
@@ -78,7 +83,14 @@ func NewStatusVerifier(istioNamespace, manifestsPath, kubeconfig, context string
 		kubeconfig:       kubeconfig,
 		context:          context,
 		iop:              installedIOP,
+		successMarker:    "✔",
+		failureMarker:    "✘",
 	}
+}
+
+func (v *StatusVerifier) Colorize() {
+	v.successMarker = color.New(color.FgGreen).Sprint(v.successMarker)
+	v.failureMarker = color.New(color.FgRed).Sprint(v.failureMarker)
 }
 
 // Verify implements Verifier interface. Here we check status of deployment
@@ -94,6 +106,13 @@ func (v *StatusVerifier) Verify() error {
 }
 
 func (v *StatusVerifier) verifyInstallIOPRevision() error {
+	var err error
+	if v.controlPlaneOpts.Revision == "" {
+		v.controlPlaneOpts.Revision, err = v.getRevision()
+		if err != nil {
+			return err
+		}
+	}
 	iop, err := v.operatorFromCluster(v.controlPlaneOpts.Revision)
 	if err != nil {
 		return fmt.Errorf("could not load IstioOperator from cluster: %v.  Use --filename", err)
@@ -104,6 +123,38 @@ func (v *StatusVerifier) verifyInstallIOPRevision() error {
 	crdCount, istioDeploymentCount, err := v.verifyPostInstallIstioOperator(
 		iop, fmt.Sprintf("in cluster operator %s", iop.GetName()))
 	return v.reportStatus(crdCount, istioDeploymentCount, err)
+}
+
+func (v *StatusVerifier) getRevision() (string, error) {
+	var revision string
+	kubeClient, err := v.createClient()
+	if err != nil {
+		return "", err
+	}
+	pods, err := kubeClient.PodsForSelector(context.TODO(), v.istioNamespace, "app=istiod")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch istiod pod, error: %v", err)
+	}
+	for _, pod := range pods.Items {
+		rev := pod.ObjectMeta.GetLabels()[label.IstioRev]
+		if rev == "default" {
+			continue
+		}
+		revision = rev
+	}
+	return revision, nil
+}
+
+func (v *StatusVerifier) createClient() (kube.ExtendedClient, error) {
+	cfg, err := kube.BuildClientConfig(v.kubeconfig, v.context)
+	if err != nil {
+		return nil, err
+	}
+	kubeClient, err := kube.NewExtendedClient(kube.NewClientConfigForRestConfig(cfg), "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect Kubernetes API server, error: %v", err)
+	}
+	return kubeClient, nil
 }
 
 func (v *StatusVerifier) verifyFinalIOP() error {
@@ -144,7 +195,7 @@ func (v *StatusVerifier) verifyPostInstallIstioOperator(iop *v1alpha1.IstioOpera
 		return 0, 0, errs.ToError()
 	}
 
-	builder := resource.NewBuilder(v.k8sConfig()).Unstructured()
+	builder := resource.NewBuilder(v.k8sConfig()).ContinueOnError().Unstructured()
 	for cat, manifest := range manifests {
 		for i, manitem := range manifest {
 			reader := strings.NewReader(manitem)
@@ -202,10 +253,13 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				Do(context.TODO()).
 				Into(deployment)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if err = verifyDeploymentStatus(deployment); err != nil {
-				return istioVerificationFailureError(filename, err)
+				ivf := istioVerificationFailureError(filename, err)
+				v.reportFailure(kind, name, namespace, ivf)
+				return ivf
 			}
 			if namespace == v.istioNamespace && strings.HasPrefix(name, "istio") {
 				istioDeploymentCount++
@@ -221,10 +275,13 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				Do(context.TODO()).
 				Into(job)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if err := verifyJobPostInstall(job); err != nil {
-				return istioVerificationFailureError(filename, err)
+				ivf := istioVerificationFailureError(filename, err)
+				v.reportFailure(kind, name, namespace, ivf)
+				return ivf
 			}
 		case "IstioOperator":
 			// It is not a problem if the cluster does not include the IstioOperator
@@ -238,6 +295,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 			by := util.ToYAML(un)
 			iop, err := operator_istio.UnmarshalIstioOperator(by, true)
 			if err != nil {
+				v.reportFailure(kind, name, namespace, err)
 				return err
 			}
 			if v.manifestsPath != "" {
@@ -263,6 +321,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 					Name(name).
 					Do(context.TODO())
 				if result.Error() != nil {
+					v.reportFailure(kind, name, namespace, result.Error())
 					return istioVerificationFailureError(filename,
 						fmt.Errorf("the required %s:%s is not ready due to: %v",
 							kind, name, result.Error()))
@@ -272,7 +331,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 				crdCount++
 			}
 		}
-		v.logger.LogAndPrintf("✔ %s: %s.%s checked successfully", kind, name, namespace)
+		v.logger.LogAndPrintf("%s %s: %s.%s checked successfully", v.successMarker, kind, name, namespace)
 		return nil
 	})
 	return crdCount, istioDeploymentCount, err
@@ -302,16 +361,17 @@ func (v *StatusVerifier) operatorFromCluster(revision string) (*v1alpha1.IstioOp
 }
 
 func (v *StatusVerifier) reportStatus(crdCount, istioDeploymentCount int, err error) error {
-	if err != nil {
-		return err
-	}
 	v.logger.LogAndPrintf("Checked %v custom resource definitions", crdCount)
 	v.logger.LogAndPrintf("Checked %v Istio Deployments", istioDeploymentCount)
 	if istioDeploymentCount == 0 {
 		v.logger.LogAndPrintf("! No Istio installation found")
 		return fmt.Errorf("no Istio installation found")
 	}
-	v.logger.LogAndPrintf("✔ Istio is installed and verified successfully")
+	if err != nil {
+		// Don't return full error; it is usually an unwielded aggregate
+		return fmt.Errorf("Istio installation failed") // nolint
+	}
+	v.logger.LogAndPrintf("%s Istio is installed and verified successfully", v.successMarker)
 	return nil
 }
 
@@ -346,9 +406,13 @@ func AllOperatorsInCluster(client dynamic.Interface) ([]*v1alpha1.IstioOperator,
 }
 
 func istioVerificationFailureError(filename string, reason error) error {
-	return fmt.Errorf("istio installation failed, incomplete or does not match \"%s\": %v", filename, reason)
+	return fmt.Errorf("Istio installation failed, incomplete or does not match \"%s\": %v", filename, reason) // nolint
 }
 
 func (v *StatusVerifier) k8sConfig() *genericclioptions.ConfigFlags {
 	return &genericclioptions.ConfigFlags{KubeConfig: &v.kubeconfig, Context: &v.context}
+}
+
+func (v *StatusVerifier) reportFailure(kind, name, namespace string, err error) {
+	v.logger.LogAndPrintf("%s %s: %s.%s: %v", v.failureMarker, kind, name, namespace, err)
 }

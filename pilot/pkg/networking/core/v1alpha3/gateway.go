@@ -136,8 +136,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			opts.filterChainOpts = filterChainOpts
 		}
 
-		l := buildListener(opts)
-		l.TrafficDirection = core.TrafficDirection_OUTBOUND
+		l := buildListener(opts, core.TrafficDirection_OUTBOUND)
 
 		mutable := &istionetworking.MutableObjects{
 			Listener: l,
@@ -659,7 +658,7 @@ func pickMatchingGatewayHosts(gatewayServerHosts map[host.Name]bool, virtualServ
 				if parts[0] != virtualService.Namespace {
 					continue
 				}
-				//strip the namespace
+				// strip the namespace
 				gwHostnameForMatching = host.Name(parts[1])
 			}
 			if gwHostnameForMatching.Matches(host.Name(vsvcHost)) {

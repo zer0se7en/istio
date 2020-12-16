@@ -24,6 +24,7 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
+	"istio.io/istio/pilot/pkg/controller/workloadentry"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/apigen"
@@ -115,10 +116,11 @@ type DiscoveryServer struct {
 	Authenticators []authenticate.Authenticator
 
 	// InternalGen is notified of connect/disconnect/nack on all connections
-	InternalGen *InternalGen
+	InternalGen             *InternalGen
+	WorkloadEntryController *workloadentry.Controller
 
 	// serverReady indicates caches have been synced up and server is ready to process requests.
-	serverReady bool
+	serverReady atomic.Bool
 
 	debounceOptions debounceOptions
 
@@ -159,7 +161,6 @@ func NewDiscoveryServer(env *model.Environment, plugins []string, instanceID str
 		pushQueue:               NewPushQueue(),
 		debugHandlers:           map[string]string{},
 		adsClients:              map[string]*Connection{},
-		serverReady:             false,
 		debounceOptions: debounceOptions{
 			debounceAfter:     features.DebounceAfter,
 			debounceMax:       features.DebounceMax,
@@ -198,21 +199,15 @@ var (
 // CachesSynced is called when caches have been synced so that server can accept connections.
 func (s *DiscoveryServer) CachesSynced() {
 	adsLog.Infof("All caches have been synced up in %v, marking server ready", time.Since(processStartTime))
-	s.updateMutex.Lock()
-	s.serverReady = true
-	s.updateMutex.Unlock()
+	s.serverReady.Store(true)
 }
 
 func (s *DiscoveryServer) IsServerReady() bool {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.serverReady
+	return s.serverReady.Load()
 }
 
 func (s *DiscoveryServer) Start(stopCh <-chan struct{}) {
-	if s.InternalGen != nil {
-		s.InternalGen.Run(stopCh)
-	}
+	go s.WorkloadEntryController.Run(stopCh)
 	go s.handleUpdates(stopCh)
 	go s.periodicRefreshMetrics(stopCh)
 	go s.sendPushes(stopCh)
@@ -500,4 +495,16 @@ func (s *DiscoveryServer) initGenerators() {
 // shutdown shutsdown DiscoveryServer components.
 func (s *DiscoveryServer) Shutdown() {
 	s.pushQueue.ShutDown()
+}
+
+// Clients returns all currently connected clients. This method can be safely called concurrently, but care
+// should be taken with the underlying objects (ie model.Proxy) to ensure proper locking.
+func (s *DiscoveryServer) Clients() []*Connection {
+	s.adsClientsMutex.RLock()
+	defer s.adsClientsMutex.RUnlock()
+	clients := make([]*Connection, 0, len(s.adsClients))
+	for _, con := range s.adsClients {
+		clients = append(clients, con)
+	}
+	return clients
 }

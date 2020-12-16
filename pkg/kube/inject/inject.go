@@ -17,8 +17,6 @@ package inject
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -94,7 +92,11 @@ type SidecarTemplateData struct {
 	ProxyConfig    *meshconfig.ProxyConfig
 	MeshConfig     *meshconfig.MeshConfig
 	Values         map[string]interface{}
+	Revision       string
 }
+
+type Template *corev1.Pod
+type Templates map[string]string
 
 // Config specifies the sidecar injection configuration This includes
 // the sidecar template and cluster-side injection policy. It is used
@@ -104,7 +106,17 @@ type Config struct {
 
 	// Template is the templated version of `SidecarInjectionSpec` prior to
 	// expansion over the `SidecarTemplateData`.
+	// Deprecated; Use Templates instead. The code will transparently convert this to a template named
+	// "sidecar" for backwards compatibility
 	Template string `json:"template"`
+
+	// DefaultTemplates defines the default template to use for pods that do not explicitly specify a template
+	// NOTE: this currently only allows a single element. This is a list to allow for future expansion
+	DefaultTemplates []string `json:"defaultTemplates"`
+
+	// Templates defines a set of templates to be used. The specified template will be run, provided with
+	// SidecarTemplateData, and merged with the original pod spec using a strategic merge patch.
+	Templates Templates `json:"templates"`
 
 	// NeverInjectSelector: Refuses the injection on pods whose labels match this selector.
 	// It's an array of label selectors, that will be OR'ed, meaning we will iterate
@@ -120,6 +132,30 @@ type Config struct {
 	// InjectedAnnotations are additional annotations that will be added to the pod spec after injection
 	// This is primarily to support PSP annotations.
 	InjectedAnnotations map[string]string `json:"injectedAnnotations"`
+}
+
+const (
+	SidecarTemplateName = "sidecar"
+)
+
+// UnmarshalConfig unmarshals the provided YAML configuration, while normalizing the resulting configuration
+// nolint: staticcheck
+func UnmarshalConfig(yml []byte) (Config, error) {
+	var injectConfig Config
+	if err := yaml.Unmarshal(yml, &injectConfig); err != nil {
+		return injectConfig, fmt.Errorf("failed to unmarshal injection template: %v", err)
+	}
+	if injectConfig.Templates == nil {
+		injectConfig.Templates = make(map[string]string)
+	}
+	if injectConfig.Template != "" && len(injectConfig.Templates) > 0 {
+		return injectConfig, fmt.Errorf(`only one of "template" or "templates" is allowed`)
+	}
+	if injectConfig.Template != "" {
+		injectConfig.Templates[SidecarTemplateName] = injectConfig.Template
+	}
+	injectConfig.Template = ""
+	return injectConfig, nil
 }
 
 func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, metadata metav1.ObjectMeta) bool { // nolint: lll
@@ -233,7 +269,7 @@ func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, m
 
 // RunTemplate renders the sidecar template
 // Returns the raw string template, as well as the parse pod form
-func RunTemplate(params InjectionParameters) ([]byte, *corev1.PodSpec, error) {
+func RunTemplate(params InjectionParameters) (mergedPod *corev1.Pod, templatePod *corev1.Pod, err error) {
 	metadata := &params.pod.ObjectMeta
 	meshConfig := params.meshConfig
 
@@ -295,6 +331,7 @@ func RunTemplate(params InjectionParameters) ([]byte, *corev1.PodSpec, error) {
 		ProxyConfig:    meshConfig.GetDefaultConfig(),
 		MeshConfig:     meshConfig,
 		Values:         values,
+		Revision:       params.revision,
 	}
 	funcMap := CreateInjectionFuncmap()
 
@@ -308,16 +345,76 @@ func RunTemplate(params InjectionParameters) ([]byte, *corev1.PodSpec, error) {
 		return bbuf.String()
 	}
 
-	bbuf, err := parseTemplate(params.template, funcMap, data)
+	bbuf, err := parseTemplate(selectTemplate(params), funcMap, data)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	podSpec := corev1.PodSpec{}
-	if err := yaml.Unmarshal(bbuf.Bytes(), &podSpec); err != nil {
+	merged, templated, err := unmarshalTemplate(params.pod, bbuf.Bytes())
+	if err != nil {
 		return nil, nil, fmt.Errorf("failed parsing generated injected YAML (check Istio sidecar injector configuration): %v", err)
 	}
-	return bbuf.Bytes(), &podSpec, nil
+
+	return merged, templated, nil
+}
+
+type legacyTemplate struct {
+	corev1.PodSpec   `json:",inline"`
+	PodRedirectAnnot map[string]string `yaml:"podRedirectAnnot"`
+}
+
+type templateIndicator struct {
+	Containers interface{}
+}
+
+// unmarshalTemplate returns the Pod for the passed in template
+// The template can be either the legacy form, with the pod spec inlined with some custom options,
+// or the new form with just a full Pod yaml (allowing overriding metadata).
+// See https://eagain.net/articles/go-dynamic-json/ for more information on dynamically parsing JSON.
+func unmarshalTemplate(originalPod *corev1.Pod, raw []byte) (*corev1.Pod, *corev1.Pod, error) {
+	indicator := &templateIndicator{}
+	if err := yaml.Unmarshal(raw, indicator); err != nil {
+		return nil, nil, fmt.Errorf("failed to read template indicator: %v", err)
+	}
+	if indicator.Containers != nil {
+		// This is a legacy format
+		injectionData := &legacyTemplate{}
+		if err := yaml.Unmarshal(raw, injectionData); err != nil {
+			return nil, nil, fmt.Errorf("failed to read template: %v", err)
+		}
+		pod := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: injectionData.PodRedirectAnnot,
+			},
+			Spec: injectionData.PodSpec,
+		}
+
+		// Merge the original pod spec with the injected overlay
+		mergedPod, err := mergeInjectedConfigLegacy(originalPod, raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to merge pod spec: %v", err)
+		}
+
+		return mergedPod, &pod, nil
+	}
+
+	// This is a Pod format
+	pod := &corev1.Pod{}
+	if err := yaml.Unmarshal(raw, pod); err != nil {
+		return nil, nil, fmt.Errorf("failed to read template: %v", err)
+	}
+
+	mergedPod, err := mergeInjectedConfig(originalPod, raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to merge pod spec: %v", err)
+	}
+
+	return mergedPod, pod, nil
+}
+
+func selectTemplate(params InjectionParameters) string {
+	// TODO in the future this will be configurable via defaultTemplates and annotation
+	return params.template[SidecarTemplateName]
 }
 
 func stripPod(req InjectionParameters) *corev1.Pod {
@@ -388,7 +485,7 @@ func parseTemplate(tmplStr string, funcMap map[string]interface{}, data SidecarT
 // IntoResourceFile injects the istio proxy into the specified
 // kubernetes YAML file.
 // nolint: lll
-func IntoResourceFile(sidecarTemplate string, valuesConfig string, revision string, meshconfig *meshconfig.MeshConfig, in io.Reader, out io.Writer, warningHandler func(string)) error {
+func IntoResourceFile(sidecarTemplate Templates, valuesConfig string, revision string, meshconfig *meshconfig.MeshConfig, in io.Reader, out io.Writer, warningHandler func(string)) error {
 	reader := yamlDecoder.NewYAMLReader(bufio.NewReaderSize(in, 4096))
 	for {
 		raw, err := reader.Read()
@@ -448,7 +545,7 @@ func FromRawToObject(raw []byte) (runtime.Object, error) {
 
 // IntoObject convert the incoming resources into Injected resources
 // nolint: lll
-func IntoObject(sidecarTemplate string, valuesConfig string, revision string, meshconfig *meshconfig.MeshConfig, in runtime.Object, warningHandler func(string)) (interface{}, error) {
+func IntoObject(sidecarTemplate Templates, valuesConfig string, revision string, meshconfig *meshconfig.MeshConfig, in runtime.Object, warningHandler func(string)) (interface{}, error) {
 	out := in.DeepCopyObject()
 
 	var deploymentMetadata *metav1.ObjectMeta
@@ -541,8 +638,9 @@ func IntoObject(sidecarTemplate string, valuesConfig string, revision string, me
 
 	// skip injection for injected pods
 	if len(podSpec.Containers) > 1 {
+		_, hasStatus := metadata.Annotations[annotation.SidecarStatus.Name]
 		for _, c := range podSpec.Containers {
-			if c.Name == ProxyContainerName {
+			if c.Name == ProxyContainerName && hasStatus {
 				warningHandler(fmt.Sprintf("===> Skipping injection because %q has injected %q sidecar already\n",
 					name, ProxyContainerName))
 				return out, nil
@@ -563,7 +661,6 @@ func IntoObject(sidecarTemplate string, valuesConfig string, revision string, me
 		deployMeta:          deploymentMetadata,
 		typeMeta:            typeMeta,
 		template:            sidecarTemplate,
-		version:             sidecarTemplateVersionHash(sidecarTemplate),
 		meshConfig:          meshconfig,
 		valuesConfig:        valuesConfig,
 		revision:            revision,
@@ -610,18 +707,10 @@ func applyJSONPatchToPod(input *corev1.Pod, patch []byte) ([]byte, error) {
 // injected sidecar. This includes the names of added containers and
 // volumes.
 type SidecarInjectionStatus struct {
-	Version          string   `json:"version"`
 	InitContainers   []string `json:"initContainers"`
 	Containers       []string `json:"containers"`
 	Volumes          []string `json:"volumes"`
 	ImagePullSecrets []string `json:"imagePullSecrets"`
-}
-
-// helper function to generate a template version identifier from a
-// hash of the un-executed template contents.
-func sidecarTemplateVersionHash(in string) string {
-	hash := sha256.Sum256([]byte(in))
-	return hex.EncodeToString(hash[:])
 }
 
 func potentialPodName(metadata metav1.ObjectMeta) string {

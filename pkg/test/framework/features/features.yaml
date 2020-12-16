@@ -45,6 +45,7 @@ features:
       loadbalancing:
     ratelimit:
       envoy:
+    original-source-ip:
   usability:
     observability:
       describe:
@@ -127,6 +128,7 @@ features:
     helm:
       default:
       firstpartyjwt:
+    upgrade:
   # describes internal build and testing infrastrcuture
   infrastructure:
     # the testing framework

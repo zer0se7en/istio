@@ -181,7 +181,7 @@ type Proxy struct {
 	IPAddresses []string
 
 	// ID is the unique platform-specific sidecar proxy ID. For k8s it is the pod ID and
-	// namespace.
+	// namespace <podName.namespace>.
 	ID string
 
 	// Locality is the location of where Envoy proxy runs. This is extracted from
@@ -470,7 +470,7 @@ type NodeMetadata struct {
 	ClusterID string `json:"CLUSTER_ID,omitempty"`
 
 	// Network defines the network the node belongs to. It is an optional metadata,
-	// set at injection time. When set, the Endpoints returned to a note and not on same network
+	// set at injection time. When set, the Endpoints returned to a node and not on same network
 	// will be replaced with the gateway defined in the settings.
 	Network string `json:"NETWORK,omitempty"`
 
@@ -508,7 +508,12 @@ type NodeMetadata struct {
 	Generator string `json:"GENERATOR,omitempty"`
 
 	// DNSCapture indicates whether the workload has enabled dns capture
-	DNSCapture string `json:"DNS_CAPTURE,omitempty"`
+	DNSCapture StringBool `json:"DNS_CAPTURE,omitempty"`
+
+	// DNSAutoAllocate indicates whether the workload should have auto allocated addresses for ServiceEntry
+	// This allows resolving ServiceEntries, which is especially useful for distinguishing TCP traffic
+	// This depends on DNSCapture.
+	DNSAutoAllocate StringBool `json:"DNS_AUTO_ALLOCATE,omitempty"`
 
 	// AutoRegister will enable auto registration of the connected endpoint to the service registry using the given WorkloadGroup name
 	AutoRegisterGroup string `json:"AUTO_REGISTER_GROUP,omitempty"`
@@ -821,7 +826,7 @@ func ParseServiceNodeWithMetadata(s string, metadata *NodeMetadata) (*Proxy, err
 	if hasValidIPAddresses(metadata.InstanceIPs) {
 		out.IPAddresses = metadata.InstanceIPs
 	} else if isValidIPAddress(parts[1]) {
-		//Fall back, use IP from node id, it's only for backward-compatibility, IP should come from metadata
+		// Fall back, use IP from node id, it's only for backward-compatibility, IP should come from metadata
 		out.IPAddresses = append(out.IPAddresses, parts[1])
 	}
 
@@ -853,7 +858,8 @@ func ParseIstioVersion(ver string) *IstioVersion {
 	// we are guaranteed to have atleast major and minor based on the regex
 	major, _ := strconv.Atoi(parts[0])
 	minor, _ := strconv.Atoi(parts[1])
-	patch := 0
+	// Assume very large patch release if not set
+	patch := 65535
 	if len(parts) > 2 {
 		patch, _ = strconv.Atoi(parts[2])
 	}
