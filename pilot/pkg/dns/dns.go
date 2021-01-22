@@ -104,10 +104,12 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string) (*LocalDNSServer, err
 	// upstream resolvers as is.
 	if dnsConfig != nil {
 		for _, s := range dnsConfig.Servers {
-			h.resolvConfServers = append(h.resolvConfServers, s+":53")
+			h.resolvConfServers = append(h.resolvConfServers, net.JoinHostPort(s, dnsConfig.Port))
 		}
 		h.searchNamespaces = dnsConfig.Search
 	}
+
+	log.WithLabels("search", h.searchNamespaces, "servers", h.resolvConfServers).Debugf("initialized DNS")
 
 	if h.udpDNSProxy, err = newDNSProxy("udp", h); err != nil {
 		return nil, err
@@ -167,7 +169,7 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 	if len(req.Question) == 0 {
 		response = new(dns.Msg)
 		response.SetReply(req)
-		response.Rcode = dns.RcodeNameError
+		response.Rcode = dns.RcodeServerFailure
 		_ = w.WriteMsg(response)
 		return
 	}
@@ -178,7 +180,7 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 	if lp == nil {
 		response = new(dns.Msg)
 		response.SetReply(req)
-		response.Rcode = dns.RcodeNameError
+		response.Rcode = dns.RcodeServerFailure
 		log.Debugf("dns request before lookup table is loaded")
 		_ = w.WriteMsg(response)
 		return
@@ -218,7 +220,7 @@ func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg)
 	var response *dns.Msg
 	for _, upstream := range h.resolvConfServers {
 		cResponse, _, err := upstreamClient.Exchange(req, upstream)
-		if err == nil && len(cResponse.Answer) > 0 {
+		if err == nil {
 			response = cResponse
 			break
 		}
@@ -226,7 +228,7 @@ func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg)
 	if response == nil {
 		response = new(dns.Msg)
 		response.SetReply(req)
-		response.Rcode = dns.RcodeNameError
+		response.Rcode = dns.RcodeServerFailure
 	}
 	return response
 }
@@ -235,6 +237,7 @@ func separateIPtypes(ips []string) (ipv4, ipv6 []net.IP) {
 	for _, ip := range ips {
 		addr := net.ParseIP(ip)
 		if addr == nil {
+			log.Debugf("ignoring un-parsable IP address: %v", ip)
 			continue
 		}
 		if addr.To4() != nil {
@@ -326,6 +329,7 @@ func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, b
 // the lookup table, where N is number of search namespaces.
 func (table *LookupTable) buildDNSAnswers(altHosts map[string]struct{}, ipv4 []net.IP, ipv6 []net.IP, searchNamespaces []string) {
 	for h := range altHosts {
+		h = strings.ToLower(h)
 		table.allHosts[h] = struct{}{}
 		if len(ipv4) > 0 {
 			table.name4[h] = a(h, ipv4)
@@ -340,7 +344,7 @@ func (table *LookupTable) buildDNSAnswers(altHosts map[string]struct{}, ipv4 []n
 
 			// host h already ends with a .
 			// search namespace does not. So we append one in the end
-			expandedHost := h + searchNamespaces[0] + "."
+			expandedHost := strings.ToLower(h + searchNamespaces[0] + ".")
 			// make sure this is not a proper hostname
 			// if host is productpage, and search namespace is ns1.svc.cluster.local
 			// then the expanded host productpage.ns1.svc.cluster.local is a valid hostname
@@ -383,6 +387,8 @@ func cname(host string, targetHost string) []dns.RR {
 	answer.Hdr = dns.RR_Header{
 		Name:   host,
 		Rrtype: dns.TypeCNAME,
+		Class:  dns.ClassINET,
+		Ttl:    defaultTTLInSeconds,
 	}
 	answer.Target = targetHost
 	return []dns.RR{answer}

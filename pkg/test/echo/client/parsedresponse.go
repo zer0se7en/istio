@@ -243,6 +243,15 @@ func almostEquals(a, b, precision int) bool {
 	return true
 }
 
+func (r ParsedResponses) CheckKey(key, expected string) error {
+	return r.Check(func(i int, response *ParsedResponse) error {
+		if response.RawResponse[key] != expected {
+			return fmt.Errorf("response[%d] %s: expected %s, received %s", i, key, expected, response.RawResponse[key])
+		}
+		return nil
+	})
+}
+
 func (r ParsedResponses) CheckCluster(expected string) error {
 	return r.Check(func(i int, response *ParsedResponse) error {
 		if response.Cluster != expected {
@@ -367,7 +376,7 @@ func parseResponse(output string) *ParsedResponse {
 
 	matches := responseHeaderFieldRegex.FindAllStringSubmatch(output, -1)
 	for _, kv := range matches {
-		sl := strings.Split(kv[1], ":")
+		sl := strings.SplitN(kv[1], ":", 2)
 		if len(sl) != 2 {
 			continue
 		}

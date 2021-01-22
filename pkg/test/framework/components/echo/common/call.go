@@ -61,17 +61,18 @@ func callInternal(srcName string, opts *echo.CallOptions, send sendFunc,
 	}
 
 	req := &proto.ForwardEchoRequest{
-		Url:           targetURL,
-		Count:         int32(opts.Count),
-		Headers:       protoHeaders,
-		TimeoutMicros: common.DurationToMicros(opts.Timeout),
-		Message:       opts.Message,
-		Http2:         opts.HTTP2,
-		Method:        opts.Method,
-		ServerFirst:   opts.Port.ServerFirst,
-		Cert:          opts.Cert,
-		Key:           opts.Key,
-		CaCert:        opts.CaCert,
+		Url:             targetURL,
+		Count:           int32(opts.Count),
+		Headers:         protoHeaders,
+		TimeoutMicros:   common.DurationToMicros(opts.Timeout),
+		Message:         opts.Message,
+		Http2:           opts.HTTP2,
+		Method:          opts.Method,
+		ServerFirst:     opts.Port.ServerFirst,
+		Cert:            opts.Cert,
+		Key:             opts.Key,
+		CaCert:          opts.CaCert,
+		FollowRedirects: opts.FollowRedirects,
 	}
 
 	var responses client.ParsedResponses
@@ -174,8 +175,8 @@ func fillInCallOptions(opts *echo.CallOptions) error {
 				return fmt.Errorf("callOptions: no port named %s available in Target Instance", opts.PortName)
 			}
 		}
-	} else if opts.Port == nil || opts.Port.ServicePort == 0 || opts.Port.Protocol == "" || opts.Address == "" {
-		return fmt.Errorf("if target is not set, then port.servicePort, port.protocol, and host must be set")
+	} else if opts.Port == nil || opts.Port.ServicePort == 0 || (opts.Port.Protocol == "" && opts.Scheme == "") || opts.Address == "" {
+		return fmt.Errorf("if target is not set, then port.servicePort, port.protocol or schema, and address must be set")
 	}
 
 	if opts.Scheme == "" {

@@ -137,10 +137,11 @@ spec:
         host: b`,
 				call: podA.CallWithRetryOrFail,
 				opts: echo.CallOptions{
-					Target:   apps.PodB[0],
-					PortName: "http",
-					Path:     "/foo?key=value",
-					Count:    callCount,
+					Target:          apps.PodB[0],
+					PortName:        "http",
+					Path:            "/foo?key=value",
+					Count:           callCount,
+					FollowRedirects: true,
 					Validator: echo.ValidatorFunc(
 						func(response echoclient.ParsedResponses, _ error) error {
 							return response.Check(func(_ int, response *echoclient.ParsedResponse) error {
@@ -404,12 +405,64 @@ spec:
 	return cases
 }
 
+func HostHeader(header string) http.Header {
+	h := http.Header{}
+	h["Host"] = []string{header}
+	return h
+}
+
+// tlsOriginationCases contains tests TLS origination from DestinationRule
+func tlsOriginationCases(apps *EchoDeployments) []TrafficTestCase {
+	tc := TrafficTestCase{
+		name: "",
+		config: fmt.Sprintf(`
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: external
+spec:
+  host: %s
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+`, apps.External[0].Config().DefaultHostHeader),
+		children: []TrafficCall{},
+	}
+	expects := []struct {
+		port int
+		alpn string
+	}{
+		{8888, "http/1.1"},
+		{8882, "h2"},
+	}
+	for _, c := range apps.PodA {
+		for _, e := range expects {
+			c := c
+			e := e
+
+			tc.children = append(tc.children, TrafficCall{
+				name: fmt.Sprintf("%s: %s", c.Config().Cluster.Name(), e.alpn),
+				opts: echo.CallOptions{
+					Port:      &echo.Port{ServicePort: e.port, Protocol: protocol.HTTP},
+					Address:   apps.External[0].Address(),
+					Headers:   HostHeader(apps.External[0].Config().DefaultHostHeader),
+					Scheme:    scheme.HTTP,
+					Validator: echo.And(echo.ExpectOK(), echo.ExpectKey("Alpn", e.alpn)),
+				},
+				call: c.CallWithRetryOrFail,
+			})
+		}
+	}
+	return []TrafficTestCase{tc}
+}
+
 // trafficLoopCases contains tests to ensure traffic does not loop through the sidecar
 func trafficLoopCases(apps *EchoDeployments) []TrafficTestCase {
 	cases := []TrafficTestCase{}
 	for _, c := range apps.PodA {
 		for _, d := range apps.PodB {
 			for _, port := range []string{"15001", "15006"} {
+				c, d, port := c, d, port
 				cases = append(cases, TrafficTestCase{
 					name: port,
 					call: func(t test.Failer, options echo.CallOptions, retryOptions ...retry.Option) echoclient.ParsedResponses {
@@ -467,20 +520,108 @@ func gatewayCases(apps *EchoDeployments) []TrafficTestCase {
 			},
 		})
 	}
-	cases = append(cases, TrafficTestCase{
-		name:   "404",
-		config: httpGateway("*"),
-		call:   apps.Ingress.CallEchoWithRetryOrFail,
-		opts: echo.CallOptions{
-			Port: &echo.Port{
-				Protocol: protocol.HTTP,
+	cases = append(cases,
+		TrafficTestCase{
+			name:   "404",
+			config: httpGateway("*"),
+			call:   apps.Ingress.CallEchoWithRetryOrFail,
+			opts: echo.CallOptions{
+				Port: &echo.Port{
+					Protocol: protocol.HTTP,
+				},
+				Headers: map[string][]string{
+					"Host": {"foo.bar"},
+				},
+				Validator: echo.ExpectCode("404"),
 			},
-			Headers: map[string][]string{
-				"Host": {"foo.bar"},
-			},
-			Validator: echo.ExpectCode("404"),
 		},
-	})
+		TrafficTestCase{
+			name: "https redirect",
+			config: `apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+    tls:
+      httpsRedirect: true
+---
+`,
+			call: apps.Ingress.CallEchoWithRetryOrFail,
+			opts: echo.CallOptions{
+				Port: &echo.Port{
+					Protocol: protocol.HTTP,
+				},
+				Validator: echo.ExpectCode("301"),
+			},
+		},
+		TrafficTestCase{
+			// See https://github.com/istio/istio/issues/27315
+			name: "https with x-forwarded-proto",
+			config: `apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+    tls:
+      httpsRedirect: true
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: ingressgateway-redirect-config
+  namespace: istio-system
+spec:
+  configPatches:
+  - applyTo: NETWORK_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+    patch:
+      operation: MERGE
+      value:
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          xff_num_trusted_hops: 1
+          normalize_path: true
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+---
+` + httpVirtualService("gateway", apps.PodA[0].Config().FQDN(), apps.PodA[0].Config().PortByName("http").ServicePort),
+			call: apps.Ingress.CallEchoWithRetryOrFail,
+			opts: echo.CallOptions{
+				Port: &echo.Port{
+					Protocol: protocol.HTTP,
+				},
+				Headers: map[string][]string{
+					// In real world, this may be set by a downstream LB that terminates the TLS
+					"X-Forwarded-Proto": {"https"},
+					"Host":              {apps.PodA[0].Config().FQDN()},
+				},
+				Validator: echo.ExpectOK(),
+			},
+		})
 	return cases
 }
 

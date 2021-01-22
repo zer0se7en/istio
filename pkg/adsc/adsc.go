@@ -320,8 +320,7 @@ func (a *ADSC) tlsConfig() (*tls.Config, error) {
 		serverCABytes, err = ioutil.ReadFile(a.cfg.XDSRootCAFile)
 	} else if a.cfg.SecretManager != nil {
 		// This is a bit crazy - we could just use the file
-		rootCA, err := a.cfg.SecretManager.GenerateSecret(context.Background(), "agent",
-			cache.RootCertReqResourceName, "")
+		rootCA, err := a.cfg.SecretManager.GenerateSecret(cache.RootCertReqResourceName)
 		if err != nil {
 			return nil, err
 		}
@@ -1162,7 +1161,7 @@ func (a *ADSC) handleMCP(gvk []string, resources []*any.Any) {
 	// remove deleted resources from cache
 	for _, config := range existingConfigs {
 		if _, ok := received[config.Namespace+"/"+config.Name]; !ok {
-			err := a.Store.Delete(config.GroupVersionKind, config.Name, config.Namespace)
+			err := a.Store.Delete(config.GroupVersionKind, config.Name, config.Namespace, nil)
 			if err != nil {
 				adscLog.Warnf("Error deleting an outdated resource from the store %v", err)
 			}

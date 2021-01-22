@@ -38,7 +38,9 @@ setup_and_export_git_sha
 source "${ROOT}/common/scripts/kind_provisioner.sh"
 
 TOPOLOGY=SINGLE_CLUSTER
-NODE_IMAGE="gcr.io/istio-testing/kindest/node:v1.19.1"
+# We are currently running from head of release-1.20, until a release containing the fix in b86925b0fbd
+# is built.
+NODE_IMAGE="gcr.io/istio-testing/kind-node:b86925b0fbd"
 KIND_CONFIG=""
 CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/prow/config/topology/multicluster.json"
 
@@ -88,7 +90,7 @@ while (( "$#" )); do
       shift 2
     ;;
     --topology-config)
-      CLUSTER_TOPOLOGY_CONFIG_FILE=$2
+      CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/${2}"
       shift 2
     ;;
     -*)
@@ -134,10 +136,10 @@ fi
 export T="${T:-"-v -count=1"}"
 export CI="true"
 
+export ARTIFACTS="${ARTIFACTS:-$(mktemp -d)}"
 trace "init" make init
 
 if [[ -z "${SKIP_SETUP:-}" ]]; then
-  export ARTIFACTS="${ARTIFACTS:-$(mktemp -d)}"
   export DEFAULT_CLUSTER_YAML="./prow/config/trustworthy-jwt.yaml"
   export METRICS_SERVER_CONFIG_DIR='./prow/config/metrics'
 

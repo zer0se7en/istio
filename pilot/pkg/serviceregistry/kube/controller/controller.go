@@ -22,6 +22,7 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/yl2chen/cidranger"
+	"go.uber.org/atomic"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -252,13 +253,16 @@ type Controller struct {
 	networkGateways map[host.Name]map[string][]*model.Gateway
 
 	once sync.Once
+	// initialized is set to true once the controller is running successfully. This ensures we do not
+	// return HasSynced=true before we are running
+	initialized *atomic.Bool
 
 	// Duration to wait for cache syncs
 	syncInterval time.Duration
 }
 
 // NewController creates a new Kubernetes controller
-// Created by bootstrap and multicluster (see secretcontroler).
+// Created by bootstrap and multicluster (see secretcontroller).
 func NewController(kubeClient kubelib.Client, options Options) *Controller {
 	// The queue requires a time duration for a retry delay after a handler error
 	c := &Controller{
@@ -278,6 +282,7 @@ func NewController(kubeClient kubelib.Client, options Options) *Controller {
 		networksWatcher:             options.NetworksWatcher,
 		metrics:                     options.Metrics,
 		syncInterval:                options.GetSyncInterval(),
+		initialized:                 atomic.NewBool(false),
 	}
 
 	if options.SystemNamespace != "" {
@@ -332,10 +337,14 @@ func (c *Controller) Cluster() string {
 }
 
 func (c *Controller) cidrRanger() cidranger.Ranger {
+	c.RLock()
+	defer c.RUnlock()
 	return c.ranger
 }
 
 func (c *Controller) defaultNetwork() string {
+	c.RLock()
+	defer c.RUnlock()
 	if c.networkForRegistry != "" {
 		return c.networkForRegistry
 	}
@@ -383,7 +392,12 @@ func (c *Controller) onServiceEvent(curr interface{}, event model.Event) error {
 		delete(c.networkGateways, svcConv.Hostname)
 		c.Unlock()
 	default:
-		if isNodePortGatewayService(svc) {
+		needsFullPush := false
+		// First, process nodePort gateway service, whose externalIPs specified
+		// and loadbalancer gateway service
+		if svcConv.Attributes.ClusterExternalAddresses != nil {
+			needsFullPush = c.extractGatewaysFromService(svcConv)
+		} else if isNodePortGatewayService(svc) {
 			// We need to know which services are using node selectors because during node events,
 			// we have to update all the node port services accordingly.
 			nodeSelector := getNodeSelectorsForService(svc)
@@ -391,10 +405,14 @@ func (c *Controller) onServiceEvent(curr interface{}, event model.Event) error {
 			// only add when it is nodePort gateway service
 			c.nodeSelectorsForServices[svcConv.Hostname] = nodeSelector
 			c.Unlock()
-			c.updateServiceNodePortAddresses(svcConv)
-		} else {
-			c.extractGatewaysFromService(svcConv)
+			needsFullPush = c.updateServiceNodePortAddresses(svcConv)
 		}
+
+		if needsFullPush {
+			// networks are different, we need to update all eds endpoints
+			c.xdsUpdater.ConfigUpdate(&model.PushRequest{Full: true, Reason: []model.TriggerReason{model.NetworksTrigger}})
+		}
+
 		// instance conversion is only required when service is added/updated.
 		instances := kube.ExternalNameServiceInstances(svc, svcConv)
 		c.Lock()
@@ -551,6 +569,9 @@ func tryGetLatestObject(informer cache.SharedIndexInformer, obj interface{}) int
 
 // HasSynced returns true after the initial state synchronization
 func (c *Controller) HasSynced() bool {
+	if !c.initialized.Load() {
+		return false
+	}
 	if (c.nsInformer != nil && !c.nsInformer.HasSynced()) ||
 		!c.serviceInformer.HasSynced() ||
 		!c.endpoints.HasSynced() ||
@@ -614,7 +635,7 @@ func (c *Controller) syncPods() error {
 func (c *Controller) syncEndpoints() error {
 	var err *multierror.Error
 	endpoints := c.endpoints.getInformer().GetStore().List()
-	log.Debugf("initializing%d endpoints", len(endpoints))
+	log.Debugf("initializing %d endpoints", len(endpoints))
 	for _, s := range endpoints {
 		err = multierror.Append(err, c.endpoints.onEvent(s, model.EventAdd))
 	}
@@ -625,11 +646,13 @@ func (c *Controller) syncEndpoints() error {
 func (c *Controller) Run(stop <-chan struct{}) {
 	if c.networksWatcher != nil {
 		c.networksWatcher.AddNetworksHandler(c.reloadNetworkLookup)
-		c.reloadNetworkLookup()
+		c.reloadMeshNetworks()
+		c.reloadNetworkGateways()
 	}
 	if c.nsInformer != nil {
 		go c.nsInformer.Run(stop)
 	}
+	c.initialized.Store(true)
 	kubelib.WaitForCacheSyncInterval(stop, c.syncInterval, c.HasSynced)
 	c.queue.Run(stop)
 	log.Infof("Controller terminated")
@@ -688,7 +711,7 @@ func (c *Controller) getPodLocality(pod *v1.Pod) string {
 
 	region := getLabelValue(nodeMeta, NodeRegionLabel, NodeRegionLabelGA)
 	zone := getLabelValue(nodeMeta, NodeZoneLabel, NodeZoneLabelGA)
-	subzone := getLabelValue(nodeMeta, label.IstioSubZone, "")
+	subzone := getLabelValue(nodeMeta, label.TopologySubzone.Name, "")
 
 	if region == "" && zone == "" && subzone == "" {
 		return ""
@@ -984,7 +1007,7 @@ func (c *Controller) onNamespaceEvent(obj interface{}, ev model.Event) error {
 			log.Warnf("Namespace watch getting wrong type in event: %T", obj)
 			return nil
 		}
-		nw = ns.Labels[label.IstioNetwork]
+		nw = ns.Labels[label.TopologyNetwork.Name]
 	}
 	c.Lock()
 	oldDefaultNetwork := c.network

@@ -29,7 +29,6 @@ import (
 
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/ghodss/yaml"
-	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/types"
 	openshiftv1 "github.com/openshift/api/apps/v1"
 	"k8s.io/api/admission/v1beta1"
@@ -51,21 +50,25 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/test/util/retry"
+	sutil "istio.io/istio/security/pkg/nodeagent/util"
 )
 
 const yamlSeparator = "\n---"
 
 var minimalSidecarTemplate = &Config{
-	Policy: InjectionPolicyEnabled,
+	Policy:           InjectionPolicyEnabled,
+	DefaultTemplates: []string{SidecarTemplateName},
 	Templates: map[string]string{SidecarTemplateName: `
-initContainers:
-- name: istio-init
-containers:
-- name: istio-proxy
-volumes:
-- name: istio-envoy
-imagePullSecrets:
-- name: istio-image-pull-secrets
+spec:
+  initContainers:
+  - name: istio-init
+  containers:
+  - name: istio-proxy
+  volumes:
+  - name: istio-envoy
+  imagePullSecrets:
+  - name: istio-image-pull-secrets
 `},
 }
 
@@ -718,19 +721,16 @@ func normalizeAndCompareDeployments(got, want *corev1.Pod, ignoreIstioMetaJSONAn
 		removeContainerEnvEntry(want, "ISTIO_METAJSON_ANNOTATIONS")
 	}
 
-	marshaler := jsonpb.Marshaler{
-		Indent: "  ",
-	}
-	gotString, err := marshaler.MarshalToString(got)
+	gotString, err := yaml.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantString, err := marshaler.MarshalToString(want)
+	wantString, err := yaml.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return util.Compare([]byte(gotString), []byte(wantString))
+	return util.Compare(gotString, wantString)
 }
 
 func removeContainerEnvEntry(pod *corev1.Pod, envVarName string) {
@@ -1014,41 +1014,27 @@ func TestRunAndServe(t *testing.T) {
 		})
 	}
 	// Now Validate that metrics are created.
-	testSideCarInjectorMetrics(t, wh)
+	testSideCarInjectorMetrics(t)
 }
 
-func testSideCarInjectorMetrics(t *testing.T, wh *Webhook) {
-	srv := httptest.NewServer(wh.mon.exporter)
-	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("failed to get /metrics: %v", err)
+func testSideCarInjectorMetrics(t *testing.T) {
+	expected := []string{
+		"sidecar_injection_requests_total",
+		"sidecar_injection_success_total",
+		"sidecar_injection_skip_total",
+		"sidecar_injection_failure_total",
 	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("failed to read body: %v", err)
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatalf("failed to close: %v", err)
-	}
-
-	output := string(body)
-
-	if !strings.Contains(output, "sidecar_injection_requests_total") {
-		t.Fatalf("metric sidecar_injection_requests_total not found")
-	}
-
-	if !strings.Contains(output, "sidecar_injection_success_total") {
-		t.Fatalf("metric sidecar_injection_success_total not found")
-	}
-
-	if !strings.Contains(output, "sidecar_injection_skip_total") {
-		t.Fatalf("metric sidecar_injection_skip_total not found")
-	}
-
-	if !strings.Contains(output, "sidecar_injection_failure_total") {
-		t.Fatalf("incorrect value for metric sidecar_injection_failure_total")
+	for _, e := range expected {
+		retry.UntilSuccessOrFail(t, func() error {
+			got, err := sutil.GetMetricsCounterValueWithTags(e, nil)
+			if err != nil {
+				return err
+			}
+			if got <= 0 {
+				return fmt.Errorf("metric empty")
+			}
+			return nil
+		})
 	}
 }
 

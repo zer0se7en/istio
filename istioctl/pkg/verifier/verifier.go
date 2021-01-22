@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	admit_v1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1batch "k8s.io/api/batch/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -115,7 +116,18 @@ func (v *StatusVerifier) verifyInstallIOPRevision() error {
 	}
 	iop, err := v.operatorFromCluster(v.controlPlaneOpts.Revision)
 	if err != nil {
-		return fmt.Errorf("could not load IstioOperator from cluster: %v.  Use --filename", err)
+		// At this point we know there is no IstioOperator defining a control plane.  This may
+		// be the case in a Istio cluster with external control plane.
+		injector, err2 := v.injectorFromCluster(v.controlPlaneOpts.Revision)
+		if err2 == nil && injector != nil {
+			// The cluster *is* configured for Istio, but no IOP is present.  This could mean
+			// - the user followed our remote control plane instructions
+			// - helm was used
+			// - user did `istioctl manifest generate | kubectl apply ...`
+			// nolint: golint,stylecheck
+			return fmt.Errorf("Istio present but verify-install needs an IstioOperator or manifest for comparison. Supply flag --filename <yaml>")
+		}
+		return fmt.Errorf("could not load IstioOperator from cluster: %v. Use --filename", err)
 	}
 	if v.manifestsPath != "" {
 		iop.Spec.InstallPackagePath = v.manifestsPath
@@ -127,6 +139,7 @@ func (v *StatusVerifier) verifyInstallIOPRevision() error {
 
 func (v *StatusVerifier) getRevision() (string, error) {
 	var revision string
+	revCount := 0
 	kubeClient, err := v.createClient()
 	if err != nil {
 		return "", err
@@ -136,12 +149,14 @@ func (v *StatusVerifier) getRevision() (string, error) {
 		return "", fmt.Errorf("failed to fetch istiod pod, error: %v", err)
 	}
 	for _, pod := range pods.Items {
-		rev := pod.ObjectMeta.GetLabels()[label.IstioRev]
+		rev := pod.ObjectMeta.GetLabels()[label.IoIstioRev.Name]
+		revCount++
 		if rev == "default" {
 			continue
 		}
 		revision = rev
 	}
+	v.logger.LogAndPrintf("%d Istio control planes detected, checking --revision %q only", revCount, revision)
 	return revision, nil
 }
 
@@ -239,7 +254,7 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 			kinds = strings.ToLower(kind) + "s"
 		}
 		if namespace == "" {
-			namespace = "default"
+			namespace = v.istioNamespace
 		}
 		switch kind {
 		case "Deployment":
@@ -301,12 +316,15 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 			if v.manifestsPath != "" {
 				iop.Spec.InstallPackagePath = v.manifestsPath
 			}
+			if v1alpha1.Namespace(iop.Spec) == "" {
+				v1alpha1.SetNamespace(iop.Spec, v.istioNamespace)
+			}
 			generatedCrds, generatedDeployments, err := v.verifyPostInstallIstioOperator(iop, filename)
+			crdCount += generatedCrds
+			istioDeploymentCount += generatedDeployments
 			if err != nil {
 				return err
 			}
-			crdCount += generatedCrds
-			istioDeploymentCount += generatedDeployments
 		default:
 			result := info.Client.
 				Get().
@@ -337,6 +355,39 @@ func (v *StatusVerifier) verifyPostInstall(visitor resource.Visitor, filename st
 	return crdCount, istioDeploymentCount, err
 }
 
+// Find Istio injector matching revision.  ("" matches any revision.)
+func (v *StatusVerifier) injectorFromCluster(revision string) (*admit_v1.MutatingWebhookConfiguration, error) {
+	kubeClient, err := v.createClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	hooks, err := kubeClient.AdmissionregistrationV1().MutatingWebhookConfigurations().List(ctx, meta_v1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	revCount := 0
+	var hookmatch *admit_v1.MutatingWebhookConfiguration
+	for _, hook := range hooks.Items {
+		rev := hook.ObjectMeta.GetLabels()[label.IoIstioRev.Name]
+		if rev != "" {
+			revCount++
+			revision = rev
+			if revision == "" || revision == rev {
+				hookmatch = &hook
+			}
+		}
+	}
+
+	v.logger.LogAndPrintf("%d Istio injectors detected", revCount)
+	if hookmatch != nil {
+		return hookmatch, nil
+	}
+
+	return nil, fmt.Errorf("Istio injector revision %q not found", revision) // nolint: golint,stylecheck
+}
+
 // Find an IstioOperator matching revision in the cluster.  The IstioOperators
 // don't have a label for their revision, so we parse them and check .Spec.Revision
 func (v *StatusVerifier) operatorFromCluster(revision string) (*v1alpha1.IstioOperator, error) {
@@ -364,11 +415,15 @@ func (v *StatusVerifier) reportStatus(crdCount, istioDeploymentCount int, err er
 	v.logger.LogAndPrintf("Checked %v custom resource definitions", crdCount)
 	v.logger.LogAndPrintf("Checked %v Istio Deployments", istioDeploymentCount)
 	if istioDeploymentCount == 0 {
-		v.logger.LogAndPrintf("! No Istio installation found")
+		if err != nil {
+			v.logger.LogAndPrintf("! No Istio installation found: %v", err)
+		} else {
+			v.logger.LogAndPrintf("! No Istio installation found")
+		}
 		return fmt.Errorf("no Istio installation found")
 	}
 	if err != nil {
-		// Don't return full error; it is usually an unwielded aggregate
+		// Don't return full error; it is usually an unwieldy aggregate
 		return fmt.Errorf("Istio installation failed") // nolint
 	}
 	v.logger.LogAndPrintf("%s Istio is installed and verified successfully", v.successMarker)

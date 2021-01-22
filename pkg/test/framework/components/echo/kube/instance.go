@@ -44,8 +44,11 @@ import (
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/components/istioctl"
 	"istio.io/istio/pkg/test/framework/resource"
+	kubeTest "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/shell"
 	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/pkg/test/util/tmpl"
 	"istio.io/istio/pkg/util/gogoprotomarshal"
 )
 
@@ -77,6 +80,10 @@ func newInstance(ctx resource.Context, originalCfg echo.Config) (out *instance, 
 	common.AddPortIfMissing(&cfg, protocol.GRPC)
 	if err = common.FillInDefaults(ctx, defaultDomain, &cfg); err != nil {
 		return nil, err
+	}
+
+	if !cfg.Cluster.IsPrimary() && cfg.DeployAsVM {
+		return nil, fmt.Errorf("cannot deploy %s as VM on non-primary %s", cfg.Service, cfg.Cluster.Name())
 	}
 
 	c := &instance{
@@ -153,43 +160,61 @@ func createVMConfig(ctx resource.Context, c *instance, cfg echo.Config) error {
 	if !cfg.ServiceAccount {
 		serviceAccount = "default"
 	}
-	istioCtl, err := istioctl.New(ctx, istioctl.Config{Cluster: cfg.Cluster.Primary()})
+	istioCtl, err := istioctl.New(ctx, istioctl.Config{Cluster: cfg.Cluster})
 	if err != nil {
 		return err
 	}
-	cmd := []string{
-		"x", "workload", "group", "create",
-		"--name", cfg.Service,
-		"--namespace", cfg.Namespace.Name(),
-		"--serviceAccount", serviceAccount,
-		"--labels", "app=" + cfg.Service,
-	}
-	wg, _, err := istioCtl.Invoke(cmd)
-	if err != nil {
-		return err
-	}
-
-	// Push the WorkloadGroup for auto-registration
-	if cfg.AutoRegisterVM {
-		if err := ctx.Config(cfg.Cluster.Primary()).ApplyYAML(cfg.Namespace.Name(), wg); err != nil {
-			return err
-		}
-	}
-
-	if cfg.ServiceAccount {
-		// create service account, the next workload command will use it to generate a token
-		err = createServiceAccount(cfg.Cluster.Primary(), cfg.Namespace.Name(), serviceAccount)
-		if err != nil && !kerrors.IsAlreadyExists(err) {
-			return err
-		}
-	}
-
 	// generate config files for VM bootstrap
 	dirname := fmt.Sprintf("%s-vm-config-", cfg.Service)
 	dir, err := ctx.CreateDirectory(dirname)
 	if err != nil {
 		return err
 	}
+
+	wg := tmpl.MustEvaluate(`
+apiVersion: networking.istio.io/v1alpha3
+kind: WorkloadGroup
+metadata:
+  name: {{.name}}
+  namespace: {{.namespace}}
+spec:
+  metadata:
+    labels:
+      app: {{.name}}
+  template:
+    serviceAccount: {{.serviceaccount}}
+    network: {{.network}}
+  probe:
+    failureThreshold: 5
+    httpGet:
+      path: /
+      port: 8080
+    periodSeconds: 2
+    successThreshold: 1
+    timeoutSeconds: 2
+
+`, map[string]string{
+		"name":           cfg.Service,
+		"namespace":      cfg.Namespace.Name(),
+		"serviceaccount": serviceAccount,
+		"network":        cfg.Cluster.NetworkName(),
+	})
+
+	// Push the WorkloadGroup for auto-registration
+	if cfg.AutoRegisterVM {
+		if err := ctx.Config(cfg.Cluster).ApplyYAML(cfg.Namespace.Name(), wg); err != nil {
+			return err
+		}
+	}
+
+	if cfg.ServiceAccount {
+		// create service account, the next workload command will use it to generate a token
+		err = createServiceAccount(cfg.Cluster, cfg.Namespace.Name(), serviceAccount)
+		if err != nil && !kerrors.IsAlreadyExists(err) {
+			return err
+		}
+	}
+
 	if err := ioutil.WriteFile(path.Join(dir, "workloadgroup.yaml"), []byte(wg), 0600); err != nil {
 		return err
 	}
@@ -216,6 +241,7 @@ func createVMConfig(ctx resource.Context, c *instance, cfg echo.Config) error {
 			"-o", subsetDir,
 		}
 		if ctx.Clusters().IsMulticluster() {
+			// When VMs talk about "cluster", they refer to the cluster they connect to for discovery
 			cmd = append(cmd, "--clusterID", c.cluster.Name())
 		}
 		if cfg.AutoRegisterVM {
@@ -229,7 +255,7 @@ func createVMConfig(ctx resource.Context, c *instance, cfg echo.Config) error {
 		if err := retry.UntilSuccess(func() error {
 			_, _, err = istioCtl.Invoke(cmd)
 			return err
-		}, retry.Timeout(5*time.Second)); err != nil {
+		}, retry.Timeout(20*time.Second)); err != nil {
 			return err
 		}
 
@@ -393,8 +419,8 @@ spec:
     app: %s
     version: %s
 `, vmPod.Name, vmPod.Status.PodIP, serviceAccount, cfg.Cluster.NetworkName(), cfg.Service, vmPod.Labels["istio.io/test-vm-version"])
-		// Deploy the workload entry.
-		if err := ctx.Config().ApplyYAML(cfg.Namespace.Name(), wle); err != nil {
+		// Deploy the workload entry to the primary cluster. We will read WorkloadEntry across clusters.
+		if err := ctx.Config(cfg.Cluster.Primary()).ApplyYAML(cfg.Namespace.Name(), wle); err != nil {
 			return err
 		}
 	}
@@ -583,4 +609,66 @@ func (c *instance) CallWithRetryOrFail(t test.Failer, opts echo.CallOptions,
 		t.Fatal(err)
 	}
 	return r
+}
+
+func (c *instance) Restart() error {
+	if err := c.Close(); err != nil {
+		return err
+	}
+
+	// fetch the original pods so we can know when the rollout is complete
+	fetch := kubeTest.NewPodMustFetch(c.cluster, c.Config().Namespace.Name(), fmt.Sprintf("%s=%s", "app", c.Config().Service))
+	origPods, err := fetch()
+	if err != nil {
+		return err
+	}
+	if err := c.restartEchoDeployments(); err != nil {
+		return err
+	}
+
+	// wait until we have the same number of pods as before in ready state
+	var pods []kubeCore.Pod
+	err = retry.UntilSuccess(func() error {
+		pods, err = kubeTest.CheckPodsAreReady(fetch)
+		if err != nil {
+			return err
+		}
+		if len(pods) != len(origPods) {
+			return fmt.Errorf("expected %d pods, got %d", len(origPods), len(pods))
+		}
+		return nil
+	}, retry.Delay(time.Second*2), retry.Timeout(c.Config().ReadinessTimeout))
+	if err != nil {
+		return fmt.Errorf("failed waiting for rollout pods ready")
+	}
+
+	// nil out the workloads and reinitialize
+	c.workloads = nil
+	if err := c.initialize(pods); err != nil {
+		return err
+	}
+	return nil
+}
+
+//restartEchoDeployments performs a `kubectl rollout restart` on the echo deployment and waits for
+// `kubectl rollout status` to complete before returning.
+func (c *instance) restartEchoDeployments() error {
+	var errs error
+	var echoDeployments []string
+	for _, s := range c.cfg.Subsets {
+		// TODO(Monkeyanator) move to common place so doesn't fall out of sync with templates
+		echoDeployments = append(echoDeployments, fmt.Sprintf("%s-%s", c.cfg.Service, s.Version))
+	}
+	for _, d := range echoDeployments {
+		rolloutCmd := fmt.Sprintf("kubectl rollout restart deployment/%s -n %s", d, c.cfg.Namespace.Name())
+		_, err := shell.Execute(true, rolloutCmd)
+		errs = multierror.Append(errs, err).ErrorOrNil()
+		if err != nil {
+			continue
+		}
+		waitCmd := fmt.Sprintf("kubectl rollout status deployment/%s -n %s", d, c.cfg.Namespace.Name())
+		_, err = shell.Execute(true, waitCmd)
+		errs = multierror.Append(errs, err).ErrorOrNil()
+	}
+	return errs
 }

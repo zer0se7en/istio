@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ghodss/yaml"
 	"gomodules.xyz/jsonpatch/v3"
 	kubeApiAdmissionv1 "k8s.io/api/admission/v1"
 	kubeApiAdmissionv1beta1 "k8s.io/api/admission/v1beta1"
@@ -325,7 +324,9 @@ type InjectionParameters struct {
 	pod                 *corev1.Pod
 	deployMeta          *metav1.ObjectMeta
 	typeMeta            *metav1.TypeMeta
-	template            Templates
+	templates           Templates
+	defaultTemplate     []string
+	aliases             map[string][]string
 	meshConfig          *meshconfig.MeshConfig
 	valuesConfig        string
 	revision            string
@@ -423,6 +424,12 @@ func injectPod(req InjectionParameters) ([]byte, error) {
 // TODO move this to api repo
 const OverrideAnnotation = "proxy.istio.io/overrides"
 
+// TemplatesAnnotation declares the set of templates to use for injection. If not specified, DefaultTemplates
+// will take precedence, which will inject a standard sidecar.
+// The format is a comma separated list. For example, `inject.istio.io/templates: sidecar,debug`.
+// TODO move this to api repo
+const TemplatesAnnotation = "inject.istio.io/templates"
+
 // reapplyOverwrittenContainers enables users to provide container level overrides for settings in the injection template
 // * originalPod: the pod before injection. If needed, we will apply some configurations from this pod on top of the final pod
 // * templatePod: the rendered injection template. This is needed only to see what containers we injected
@@ -501,6 +508,44 @@ func reapplyOverwrittenContainers(finalPod *corev1.Pod, originalPod *corev1.Pod,
 	}
 
 	return finalPod, nil
+}
+
+// reinsertOverrides applies the containers listed in OverrideAnnotation to a pod. This is to achieve
+// idempotency by handling an edge case where an injection template is modifying a container already
+// present in the pod spec. In these cases, the logic to strip injected containers would remove the
+// original injected parts as well, leading to the templating logic being different (for example,
+// reading the .Spec.Containers field would be empty).
+func reinsertOverrides(pod *corev1.Pod) (*corev1.Pod, error) {
+	type podOverrides struct {
+		Containers     []corev1.Container `json:"containers,omitempty"`
+		InitContainers []corev1.Container `json:"initContainers,omitempty"`
+	}
+
+	existingOverrides := podOverrides{}
+	if annotationOverrides, f := pod.Annotations[OverrideAnnotation]; f {
+		if err := json.Unmarshal([]byte(annotationOverrides), &existingOverrides); err != nil {
+			return nil, err
+		}
+	}
+
+	pod = pod.DeepCopy()
+	for _, c := range existingOverrides.Containers {
+		match := FindContainer(c.Name, pod.Spec.Containers)
+		if match != nil {
+			continue
+		}
+		pod.Spec.Containers = append(pod.Spec.Containers, c)
+	}
+
+	for _, c := range existingOverrides.InitContainers {
+		match := FindContainer(c.Name, pod.Spec.InitContainers)
+		if match != nil {
+			continue
+		}
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, c)
+	}
+
+	return pod, nil
 }
 
 func createPatch(pod *corev1.Pod, original []byte) ([]byte, error) {
@@ -708,43 +753,6 @@ func applyOverlay(target *corev1.Pod, overlayJSON []byte) (*corev1.Pod, error) {
 	return &pod, nil
 }
 
-func mergeInjectedConfigLegacy(req *corev1.Pod, injected []byte) (*corev1.Pod, error) {
-	current, err := json.Marshal(req.Spec)
-	if err != nil {
-		return nil, err
-	}
-
-	// The template is yaml, StrategicMergePatch expects JSON
-	injectedJSON, err := yaml.YAMLToJSON(injected)
-	if err != nil {
-		return nil, fmt.Errorf("yaml to json: %v", err)
-	}
-
-	podSpec := corev1.PodSpec{}
-	// Overlay the injected template onto the original podSpec
-	patched, err := strategicpatch.StrategicMergePatch(current, injectedJSON, podSpec)
-	if err != nil {
-		return nil, fmt.Errorf("strategic merge: %v", err)
-	}
-	if err := json.Unmarshal(patched, &podSpec); err != nil {
-		return nil, fmt.Errorf("unmarshal patched pod: %v", err)
-	}
-	pod := req.DeepCopy()
-	pod.Spec = podSpec
-
-	return pod, nil
-}
-
-func mergeInjectedConfig(req *corev1.Pod, injected []byte) (*corev1.Pod, error) {
-	// The template is yaml, StrategicMergePatch expects JSON
-	injectedJSON, err := yaml.YAMLToJSON(injected)
-	if err != nil {
-		return nil, fmt.Errorf("yaml to json: %v", err)
-	}
-
-	return applyOverlay(req, injectedJSON)
-}
-
 func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.AdmissionResponse {
 	req := ar.Request
 	var pod corev1.Pod
@@ -778,7 +786,9 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 		pod:                 &pod,
 		deployMeta:          deploy,
 		typeMeta:            typeMeta,
-		template:            wh.Config.Templates,
+		templates:           wh.Config.Templates,
+		defaultTemplate:     wh.Config.DefaultTemplates,
+		aliases:             wh.Config.Aliases,
 		meshConfig:          wh.meshConfig,
 		valuesConfig:        wh.valuesConfig,
 		revision:            wh.revision,

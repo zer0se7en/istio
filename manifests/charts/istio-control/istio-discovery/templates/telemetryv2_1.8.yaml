@@ -23,7 +23,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -58,7 +58,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -93,7 +93,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -205,9 +205,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -259,9 +259,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -313,9 +313,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -347,10 +347,18 @@ spec:
                     {{- end }}
                 vm_config:
                   vm_id: stats_outbound
+                  {{- if .Values.telemetry.v2.prometheus.wasmEnabled }}
+                  runtime: envoy.wasm.runtime.v8
+                  allow_precompiled: true
+                  code:
+                    local:
+                      filename: /etc/istio/extensions/stats-filter.compiled.wasm
+                  {{- else }}
                   runtime: envoy.wasm.runtime.null
                   code:
                     local:
                       inline_string: envoy.wasm.stats
+                  {{- end }}
 ---
 # Note: tcp stats filter is wasm enabled only in sidecars.
 apiVersion: networking.istio.io/v1alpha3
@@ -374,7 +382,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.tcp_proxy"
+              name: "envoy.filters.network.tcp_proxy"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -426,7 +434,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.tcp_proxy"
+              name: "envoy.filters.network.tcp_proxy"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -478,7 +486,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.tcp_proxy"
+              name: "envoy.filters.network.tcp_proxy"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -510,14 +518,20 @@ spec:
                     {{- end }}
                 vm_config:
                   vm_id: tcp_stats_outbound
+                  {{- if .Values.telemetry.v2.prometheus.wasmEnabled }}
+                  runtime: envoy.wasm.runtime.v8
+                  allow_precompiled: true
+                  code:
+                    local:
+                      filename: /etc/istio/extensions/stats-filter.compiled.wasm
+                  {{- else }}
                   runtime: envoy.wasm.runtime.null
                   code:
                     local:
                       inline_string: "envoy.wasm.stats"
+                  {{- end }}
 ---
-
 {{- end }}
-
 {{- if .Values.telemetry.v2.stackdriver.enabled }}
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
@@ -541,9 +555,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -576,9 +590,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -610,9 +624,9 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
-                name: "envoy.router"
+                name: "envoy.filters.http.router"
       patch:
         operation: INSERT_BEFORE
         value:
@@ -637,7 +651,6 @@ spec:
                   code:
                     local: { inline_string: envoy.wasm.null.stackdriver }
 ---
-
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -660,7 +673,7 @@ spec:
       listener:
         filterChain:
           filter:
-            name: "envoy.tcp_proxy"
+            name: "envoy.filters.network.tcp_proxy"
     patch:
       operation: INSERT_BEFORE
       value:
@@ -693,7 +706,7 @@ spec:
       listener:
         filterChain:
           filter:
-            name: "envoy.tcp_proxy"
+            name: "envoy.filters.network.tcp_proxy"
     patch:
       operation: INSERT_BEFORE
       value:
@@ -725,7 +738,7 @@ spec:
       listener:
         filterChain:
           filter:
-            name: "envoy.tcp_proxy"
+            name: "envoy.filters.network.tcp_proxy"
     patch:
       operation: INSERT_BEFORE
       value:
@@ -772,7 +785,7 @@ spec:
         listener:
           filterChain:
             filter:
-              name: "envoy.http_connection_manager"
+              name: "envoy.filters.network.http_connection_manager"
               subFilter:
                 name: "istio.stackdriver"
       patch:
