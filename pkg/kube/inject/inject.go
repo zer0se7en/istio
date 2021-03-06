@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -95,8 +96,10 @@ type SidecarTemplateData struct {
 	Revision       string
 }
 
-type Template *corev1.Pod
-type Templates map[string]string
+type (
+	Template  *corev1.Pod
+	Templates map[string]string
+)
 
 // Config specifies the sidecar injection configuration This includes
 // the sidecar template and cluster-side injection policy. It is used
@@ -741,9 +744,15 @@ func updateClusterEnvs(container *corev1.Container, newKVs map[string]string) {
 			envVars = append(envVars, env)
 		}
 	}
-	for k, v := range newKVs {
-		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v, ValueFrom: nil})
-	}
 
+	keys := make([]string, 0, len(newKVs))
+	for key := range newKVs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := newKVs[key]
+		envVars = append(envVars, corev1.EnvVar{Name: key, Value: val, ValueFrom: nil})
+	}
 	container.Env = envVars
 }

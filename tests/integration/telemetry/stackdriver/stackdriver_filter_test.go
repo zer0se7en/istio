@@ -98,6 +98,7 @@ func TestStackdriverMonitoring(t *testing.T) {
 		Run(func(ctx framework.TestContext) {
 			g, _ := errgroup.WithContext(context.Background())
 			for _, cltInstance := range clt {
+				cltInstance := cltInstance
 				g.Go(func() error {
 					err := retry.UntilSuccess(func() error {
 						if err := sendTraffic(t, cltInstance); err != nil {
@@ -106,7 +107,7 @@ func TestStackdriverMonitoring(t *testing.T) {
 						clName := cltInstance.Config().Cluster.Name()
 						scopes.Framework.Infof("Validating for cluster %s", clName)
 
-						//Validate cluster names in telemetry below once https://github.com/istio/istio/issues/28125 is fixed.
+						// Validate cluster names in telemetry below once https://github.com/istio/istio/issues/28125 is fixed.
 						if err := validateMetrics(t, serverRequestCount, clientRequestCount, clName); err != nil {
 							return err
 						}
@@ -125,9 +126,7 @@ func TestStackdriverMonitoring(t *testing.T) {
 						t.Logf("Edges validated")
 
 						return nil
-
 					}, retry.Delay(telemetrypkg.RetryDelay), retry.Timeout(telemetrypkg.RetryTimeout))
-
 					if err != nil {
 						return err
 					}
@@ -219,7 +218,8 @@ func testSetup(ctx resource.Context) (err error) {
 							},
 						},
 					},
-				}}).
+				},
+			}).
 			WithConfig(echo.Config{
 				Service:   "srv",
 				Cluster:   cls,
@@ -252,7 +252,8 @@ func testSetup(ctx resource.Context) (err error) {
 							},
 						},
 					},
-				}})
+				},
+			})
 	}
 	echos, err := builder.Build()
 	if err != nil {

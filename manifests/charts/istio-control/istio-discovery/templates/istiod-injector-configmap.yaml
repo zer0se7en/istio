@@ -21,8 +21,14 @@ data:
   # to fine tune it or use it with kube-inject.
   config: |-
     # defaultTemplates defines the default template to use for pods that do not explicitly specify a template
-    # NOTE: this currently only allows a single element
+    {{- if .Values.sidecarInjectorWebhook.defaultTemplates }}
+    defaultTemplates:
+{{- range .Values.sidecarInjectorWebhook.defaultTemplates}}
+    - {{ . }}
+{{- end }}
+    {{- else }}
     defaultTemplates: [sidecar]
+    {{- end }}
     policy: {{ .Values.global.proxy.autoInject }}
     alwaysInjectSelector:
 {{ toYaml .Values.sidecarInjectorWebhook.alwaysInjectSelector | trim | indent 6 }}
@@ -41,6 +47,10 @@ data:
 {{- if not (hasKey .Values.sidecarInjectorWebhook.templates "sidecar") }}
       sidecar: |
 {{ .Files.Get "files/injection-template.yaml" | trim | indent 8 }}
+{{- end }}
+{{- if not (hasKey .Values.sidecarInjectorWebhook.templates "gateway") }}
+      gateway: |
+{{ .Files.Get "files/gateway-injection-template.yaml" | trim | indent 8 }}
 {{- end }}
 {{- with .Values.sidecarInjectorWebhook.templates }}
 {{ toYaml . | trim | indent 6 }}

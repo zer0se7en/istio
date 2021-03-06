@@ -84,6 +84,7 @@ var EchoPorts = []echo.Port{
 	{Name: "auto-grpc", Protocol: protocol.GRPC, ServicePort: 7071, InstancePort: 17071},
 	{Name: "auto-https", Protocol: protocol.HTTPS, ServicePort: 9443, InstancePort: 19443},
 	{Name: "http-instance", Protocol: protocol.HTTP, ServicePort: 82, InstancePort: 18082, InstanceIP: true},
+	{Name: "http-localhost", Protocol: protocol.HTTP, ServicePort: 84, InstancePort: 18084, LocalhostIP: true},
 }
 
 var WorkloadPorts = []echo.WorkloadPort{
@@ -178,7 +179,8 @@ func SetupApps(ctx resource.Context, i istio.Instance, apps *EchoDeployments) er
 				{
 					Annotations: map[echo.Annotation]*echo.AnnotationValue{
 						echo.SidecarInject: {
-							Value: strconv.FormatBool(false)},
+							Value: strconv.FormatBool(false),
+						},
 					},
 				},
 			},
@@ -193,7 +195,8 @@ func SetupApps(ctx resource.Context, i istio.Instance, apps *EchoDeployments) er
 				{
 					Annotations: map[echo.Annotation]*echo.AnnotationValue{
 						echo.SidecarInject: {
-							Value: strconv.FormatBool(false)},
+							Value: strconv.FormatBool(false),
+						},
 					},
 				},
 			},
@@ -207,21 +210,16 @@ func SetupApps(ctx resource.Context, i istio.Instance, apps *EchoDeployments) er
 				Annotations: echo.NewAnnotations().Set(echo.SidecarInterceptionMode, "TPROXY"),
 			}},
 			WorkloadOnlyPorts: WorkloadPorts,
+		}).
+		WithConfig(echo.Config{
+			Service:           VMSvc,
+			Namespace:         apps.Namespace,
+			Ports:             EchoPorts,
+			DeployAsVM:        true,
+			AutoRegisterVM:    true,
+			Subsets:           []echo.SubsetConfig{{}},
+			WorkloadOnlyPorts: WorkloadPorts,
 		})
-	if !ctx.Settings().SkipVM {
-		// It only makes sense to deploy echo VMs on a primary cluster.
-		// TODO in the future non-kube Cluster types will support VMs
-		builder = builder.WithClusters(ctx.Clusters().Primaries()...).
-			WithConfig(echo.Config{
-				Service:           VMSvc,
-				Namespace:         apps.Namespace,
-				Ports:             EchoPorts,
-				DeployAsVM:        true,
-				AutoRegisterVM:    true,
-				Subsets:           []echo.SubsetConfig{{}},
-				WorkloadOnlyPorts: WorkloadPorts,
-			})
-	}
 
 	echos, err := builder.Build()
 	if err != nil {

@@ -83,6 +83,7 @@ func TestStatsFilter(t *testing.T, feature features.Feature) {
 		Run(func(ctx framework.TestContext) {
 			g, _ := errgroup.WithContext(context.Background())
 			for _, cltInstance := range client {
+				cltInstance := cltInstance
 				g.Go(func() error {
 					err := retry.UntilSuccess(func() error {
 						if err := SendTraffic(cltInstance); err != nil {
@@ -138,6 +139,7 @@ func TestStatsTCPFilter(t *testing.T, feature features.Feature) {
 		Run(func(ctx framework.TestContext) {
 			g, _ := errgroup.WithContext(context.Background())
 			for _, cltInstance := range client {
+				cltInstance := cltInstance
 				g.Go(func() error {
 					err := retry.UntilSuccess(func() error {
 						if err := SendTCPTraffic(cltInstance); err != nil {
@@ -251,9 +253,10 @@ func TestSetup(ctx resource.Context) (err error) {
 // SendTraffic makes a client call to the "server" service on the http port.
 func SendTraffic(cltInstance echo.Instance) error {
 	_, err := cltInstance.Call(echo.CallOptions{
-		Target:   server[0],
-		PortName: "http",
-		Count:    util.RequestCountMultipler * len(server),
+		Target:    server[0],
+		PortName:  "http",
+		Count:     util.RequestCountMultipler * len(server),
+		Validator: echo.ExpectOK(),
 	})
 	if err != nil {
 		return err

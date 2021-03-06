@@ -21,6 +21,7 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
 	"istio.io/istio/pkg/test/framework/components/namespace"
@@ -94,7 +95,7 @@ func SetupApps(appCtx *AppContext) resource.SetupFn {
 				WithConfig(echoLbCfg).
 				WithConfig(newEchoConfig("local", appCtx.LocalNamespace, cluster))
 			for i := 0; i < uniqSvcPerCluster; i++ {
-				svcName := fmt.Sprintf("echo-%s-%d", cluster.Name(), i)
+				svcName := fmt.Sprintf("echo-%s-%d", cluster.StableName(), i)
 				builder = builder.WithConfig(newEchoConfig(svcName, appCtx.Namespace, cluster))
 			}
 		}
@@ -113,7 +114,7 @@ func SetupApps(appCtx *AppContext) resource.SetupFn {
 	}
 }
 
-func newEchoConfig(service string, ns namespace.Instance, cluster resource.Cluster) echo.Config {
+func newEchoConfig(service string, ns namespace.Instance, cluster cluster.Cluster) echo.Config {
 	return echo.Config{
 		Service:        service,
 		Namespace:      ns,

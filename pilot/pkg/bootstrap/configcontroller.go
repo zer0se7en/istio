@@ -214,7 +214,6 @@ func (s *Server) initConfigSources(args *PilotArgs) (err error) {
 // running Analyzers for status updates.  The Status Updater will eventually need to allow input from istiod
 // to support config distribution status as well.
 func (s *Server) initInprocessAnalysisController(args *PilotArgs) error {
-
 	processingArgs := settings.DefaultArgs()
 	processingArgs.KubeConfig = args.RegistryOptions.KubeConfig
 	processingArgs.WatchedNamespaces = args.RegistryOptions.KubeOptions.WatchedNamespaces
@@ -263,14 +262,13 @@ func (s *Server) initStatusController(args *PilotArgs, writeStatus bool) {
 	}
 	s.statusReporter.Init(s.environment.GetLedger())
 	s.addTerminatingStartFunc(func(stop <-chan struct{}) error {
-		// if we don't have a kubeclient, no reason to run the status reporter...
-		if writeStatus && s.kubeClient != nil {
+		if writeStatus {
 			s.statusReporter.Start(s.kubeClient, args.Namespace, args.PodName, stop)
 		}
 		return nil
 	})
 	s.XDSServer.StatusReporter = s.statusReporter
-	if writeStatus && s.kubeRestConfig != nil {
+	if writeStatus {
 		s.addTerminatingStartFunc(func(stop <-chan struct{}) error {
 			controller := status.NewController(*s.kubeRestConfig, args.Namespace, s.RWConfigStore)
 			leaderelection.

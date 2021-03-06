@@ -14,6 +14,7 @@ spec:
   template:
     metadata:
       annotations:
+        kubectl.kubernetes.io/default-container: hello
         kubectl.kubernetes.io/default-logs-container: hello
         prometheus.io/path: /stats/prometheus
         prometheus.io/port: "15020"
@@ -31,6 +32,7 @@ spec:
         service.istio.io/canonical-name: hello
         service.istio.io/canonical-revision: latest
         tier: backend
+        topology.istio.io/network: network1
         track: stable
     spec:
       containers:
@@ -109,6 +111,8 @@ spec:
           value: cluster.local
         - name: TRUST_DOMAIN
           value: cluster.local
+        - name: ISTIO_META_NETWORK
+          value: network1
         image: gcr.io/istio-testing/proxyv2:latest
         name: istio-proxy
         ports:

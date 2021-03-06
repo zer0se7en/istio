@@ -60,7 +60,7 @@ var (
 
 	// Snapshot charts are in testdata/manifest-generate/data-snapshot
 	snapshotCharts = func() chartSourceType {
-		d, err := os.MkdirTemp("", "data-snapshot-")
+		d, err := ioutil.TempDir("", "data-snapshot-*")
 		if err != nil {
 			panic(fmt.Errorf("failed to make temp dir: %v", err))
 		}
@@ -501,7 +501,6 @@ func TestInstallPackagePath(t *testing.T) {
 			flags:      "--force --set installPackagePath=" + srv.URL() + "/" + testTGZFilename,
 		},
 	})
-
 }
 
 // TestTrailingWhitespace ensures there are no trailing spaces in the manifests
@@ -708,7 +707,6 @@ func runTestGroup(t *testing.T, tests testGroup) {
 					t.Errorf("%s: got:\n%s\nwant:\n%s\n(-got, +want)\n%s\n", tt.desc, "", "", diff)
 				}
 			}
-
 		})
 	}
 }
@@ -937,4 +935,13 @@ func selectorMatches(t *testing.T, selector *metav1.LabelSelector, labels klabel
 		t.Fatal(err)
 	}
 	return s.Matches(labels)
+}
+
+func TestSidecarTemplate(t *testing.T) {
+	runTestGroup(t, testGroup{
+		{
+			desc:       "sidecar_template",
+			diffSelect: "ConfigMap:*:istio-sidecar-injector",
+		},
+	})
 }
