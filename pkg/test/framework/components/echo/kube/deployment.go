@@ -89,13 +89,19 @@ spec:
 `
 
 	deploymentYAML = `
+{{- $revVerMap := .IstioVersions }}
 {{- $subsets := .Subsets }}
 {{- $cluster := .Cluster }}
 {{- range $i, $subset := $subsets }}
+{{- range $revision, $version := $revVerMap }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+{{- if $.IsMultiVersion }}
+  name: {{ $.Service }}-{{ $subset.Version }}-{{ $revision }}
+{{- else }}
   name: {{ $.Service }}-{{ $subset.Version }}
+{{- end }}
 spec:
   replicas: 1
   selector:
@@ -110,6 +116,9 @@ spec:
       labels:
         app: {{ $.Service }}
         version: {{ $subset.Version }}
+{{- if $.IsMultiVersion }}
+        istio.io/rev: {{ $revision }}
+{{- end }}
 {{- if ne $.Locality "" }}
         istio-locality: {{ $.Locality }}
 {{- end }}
@@ -145,6 +154,9 @@ spec:
       - name: app
         image: {{ $.Hub }}/app:{{ $.Tag }}
         imagePullPolicy: {{ $.PullPolicy }}
+        securityContext:
+          runAsUser: 1338
+          runAsGroup: 1338
         args:
           - --metrics=15014
           - --cluster
@@ -187,6 +199,8 @@ spec:
 {{- end }}
           - --version
           - "{{ $subset.Version }}"
+          - --istio-version
+          - "{{ $version }}"
 {{- if $.TLSSettings }}
           - --crt=/etc/certs/custom/cert-chain.pem
           - --key=/etc/certs/custom/key.pem
@@ -231,13 +245,19 @@ spec:
         - mountPath: /etc/certs/custom
           name: custom-certs
       volumes:
+{{- if $.TLSSettings.ProxyProvision }}
+      - emptyDir:
+          medium: Memory
+{{- else }}
       - configMap:
           name: {{ $.Service }}-certs
+{{- end }}
         name: custom-certs
-{{- end}}
+{{- end }}
 ---
-{{- end}}
-{{- if .TLSSettings }}
+{{- end }}
+{{- end }}
+{{- if .TLSSettings}}{{if not .TLSSettings.ProxyProvision }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -250,7 +270,7 @@ data:
   key.pem: |
 {{.TLSSettings.Key | indent 4}}
 ---
-{{- end}}
+{{- end}}{{- end}}
 `
 
 	// vmDeploymentYaml aims to simulate a VM, but instead of managing the complex test setup of spinning up a VM,
@@ -331,8 +351,6 @@ spec:
           # read certs from correct directory
           sudo sh -c 'echo PROV_CERT=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
           sudo sh -c 'echo OUTPUT_CERTS=/var/run/secrets/istio >> /var/lib/istio/envoy/cluster.env'
-          # Block standard inbound ports
-          sudo sh -c 'echo ISTIO_LOCAL_EXCLUDE_PORTS="15090,15021,15020" >> /var/lib/istio/envoy/cluster.env'
 
           # TODO: run with systemctl?
           export ISTIO_AGENT_FLAGS="--concurrency 2"
@@ -358,6 +376,20 @@ spec:
 {{- end }}
 {{- if $p.LocalhostIP }}
              --bind-localhost={{ $p.Port }} \
+{{- end }}
+{{- end }}
+{{- range $i, $p := $.WorkloadOnlyPorts }}
+{{- if eq .Protocol "TCP" }}
+             --tcp \
+{{- else }}
+             --port \
+{{- end }}
+             "{{ $p.Port }}" \
+{{- if $p.TLS }}
+             --tls={{ $p.Port }} \
+{{- end }}
+{{- if $p.ServerFirst }}
+             --server-first={{ $p.Port }} \
 {{- end }}
 {{- end }}
              --crt=/var/lib/istio/cert.crt \
@@ -444,11 +476,11 @@ func newDeployment(ctx resource.Context, cfg echo.Config) (*deployment, error) {
 		}
 	}
 
-	deploymentYAML, err := generateDeploymentYAML(cfg, nil)
+	deploymentYAML, err := generateDeploymentYAML(cfg, nil, ctx.Settings().IstioVersions)
 	if err != nil {
-		return nil, fmt.Errorf("failed generating echo deployment YAML for %s/%s",
+		return nil, fmt.Errorf("failed generating echo deployment YAML for %s/%s: %v",
 			cfg.Namespace.Name(),
-			cfg.Service)
+			cfg.Service, err)
 	}
 
 	// Apply the deployment to the configured cluster.
@@ -541,8 +573,8 @@ spec:
 `, name, podIP, sa, network, service, version)
 }
 
-func generateDeploymentYAML(cfg echo.Config, settings *image.Settings) (string, error) {
-	params, err := templateParams(cfg, settings)
+func generateDeploymentYAML(cfg echo.Config, settings *image.Settings, versions resource.RevVerMap) (string, error) {
+	params, err := templateParams(cfg, settings, versions)
 	if err != nil {
 		return "", err
 	}
@@ -556,7 +588,7 @@ func generateDeploymentYAML(cfg echo.Config, settings *image.Settings) (string, 
 }
 
 func GenerateService(cfg echo.Config) (string, error) {
-	params, err := templateParams(cfg, nil)
+	params, err := templateParams(cfg, nil, resource.RevVerMap{})
 	if err != nil {
 		return "", err
 	}
@@ -566,7 +598,7 @@ func GenerateService(cfg echo.Config) (string, error) {
 
 const DefaultVMImage = "app_sidecar_ubuntu_bionic"
 
-func templateParams(cfg echo.Config, settings *image.Settings) (map[string]interface{}, error) {
+func templateParams(cfg echo.Config, settings *image.Settings, versions resource.RevVerMap) (map[string]interface{}, error) {
 	if settings == nil {
 		var err error
 		settings, err = image.SettingsFromCommandLine()
@@ -620,6 +652,8 @@ func templateParams(cfg echo.Config, settings *image.Settings) (map[string]inter
 		},
 		"StartupProbe":    supportStartupProbe,
 		"IncludeExtAuthz": cfg.IncludeExtAuthz,
+		"IstioVersions":   versions.TemplateMap(),
+		"IsMultiVersion":  versions.IsMultiVersion(),
 	}
 	return params, nil
 }

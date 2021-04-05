@@ -26,6 +26,7 @@ import (
 
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/util/sets"
+	"istio.io/istio/pkg/config"
 	"istio.io/pkg/monitoring"
 )
 
@@ -89,11 +90,24 @@ func indexConfig(configIndex map[ConfigKey]sets.Set, k string, entry XdsCacheEnt
 	}
 }
 
+func indexType(typeIndex map[config.GroupVersionKind]sets.Set, k string, entry XdsCacheEntry) {
+	for _, t := range entry.DependentTypes() {
+		if typeIndex[t] == nil {
+			typeIndex[t] = sets.NewSet()
+		}
+		typeIndex[t].Insert(k)
+	}
+}
+
 // XdsCacheEntry interface defines functions that should be implemented by
 // resources that can be cached.
 type XdsCacheEntry interface {
 	// Key is the key to be used in cache.
 	Key() string
+	// DependentTypes are config types that this cache key is dependant on.
+	// Whenever any configs of this type changes, we should invalidate this cache entry.
+	// Note: DependentConfigs should be preferred wherever possible.
+	DependentTypes() []config.GroupVersionKind
 	// DependentConfigs is config items that this cache key is dependent on.
 	// Whenever these configs change, we should invalidate this cache entry.
 	DependentConfigs() []ConfigKey
@@ -135,19 +149,34 @@ type XdsCache interface {
 // NewXdsCache returns an instance of a cache.
 func NewXdsCache() XdsCache {
 	return &lruCache{
-		store:       newLru(),
-		configIndex: map[ConfigKey]sets.Set{},
-		nextToken:   atomic.NewUint64(0),
+		enableAssertions: features.EnableUnsafeAssertions,
+		store:            newLru(),
+		configIndex:      map[ConfigKey]sets.Set{},
+		typesIndex:       map[config.GroupVersionKind]sets.Set{},
+		nextToken:        atomic.NewUint64(0),
+	}
+}
+
+// NewLenientXdsCache returns an instance of a cache that does not validate token based get/set and enable assertions.
+func NewLenientXdsCache() XdsCache {
+	return &lruCache{
+		enableAssertions: false,
+		store:            newLru(),
+		configIndex:      map[ConfigKey]sets.Set{},
+		typesIndex:       map[config.GroupVersionKind]sets.Set{},
+		nextToken:        atomic.NewUint64(0),
 	}
 }
 
 type lruCache struct {
-	store simplelru.LRUCache
+	enableAssertions bool
+	store            simplelru.LRUCache
 	// nextToken stores the next token to use. The content here doesn't matter, we just need a cheap
 	// unique identifier.
 	nextToken   *atomic.Uint64
 	mu          sync.RWMutex
 	configIndex map[ConfigKey]sets.Set
+	typesIndex  map[config.GroupVersionKind]sets.Set
 }
 
 var _ XdsCache = &lruCache{}
@@ -170,8 +199,8 @@ func newLru() simplelru.LRUCache {
 // because multiple writers may get cache misses concurrently, but they ought to generate identical
 // configuration. This also checks that our XDS config generation is deterministic, which is a very
 // important property.
-func assertUnchanged(existing *any.Any, replacement *any.Any) {
-	if features.EnableUnsafeAssertions {
+func (l *lruCache) assertUnchanged(existing *any.Any, replacement *any.Any) {
+	if l.enableAssertions {
 		if existing == nil {
 			// This is a new addition, not an update
 			return
@@ -207,14 +236,15 @@ func (l *lruCache) Add(entry XdsCacheEntry, token CacheToken, value *any.Any) {
 		// first write, or we forgot to call Get before.
 		return
 	}
-	if features.EnableUnsafeAssertions {
+	if l.enableAssertions {
 		if toWrite.token == 0 {
 			panic("token cannot be empty. was Get() called before Add()?")
 		}
-		assertUnchanged(cur.(cacheValue).value, value)
+		l.assertUnchanged(cur.(cacheValue).value, value)
 	}
 	l.store.Add(k, toWrite)
 	indexConfig(l.configIndex, entry.Key(), entry)
+	indexType(l.typesIndex, entry.Key(), entry)
 	size(l.store.Len())
 }
 
@@ -257,6 +287,11 @@ func (l *lruCache) Clear(configs map[ConfigKey]struct{}) {
 		referenced := l.configIndex[ckey]
 		delete(l.configIndex, ckey)
 		for key := range referenced {
+			l.store.Remove(key)
+		}
+		tReferenced := l.typesIndex[ckey.Kind]
+		delete(l.typesIndex, ckey.Kind)
+		for key := range tReferenced {
 			l.store.Remove(key)
 		}
 	}

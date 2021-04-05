@@ -142,7 +142,7 @@ var (
 	AlphaAnnotation = diag.NewMessageType(diag.Info, "IST0136", "Annotation %q is part of an alpha-phase feature and may be incompletely supported.")
 
 	// DeploymentConflictingPorts defines a diag.MessageType for message "DeploymentConflictingPorts".
-	// Description: Two services selecting the same workload with same target port are MUST refer to the same port.
+	// Description: Two services selecting the same workload with the same targetPort MUST refer to the same port.
 	DeploymentConflictingPorts = diag.NewMessageType(diag.Warning, "IST0137", "This deployment %s is associated with multiple services %v using targetPort %q but different ports: %v.")
 
 	// GatewayDuplicateCertificate defines a diag.MessageType for message "GatewayDuplicateCertificate".
@@ -152,6 +152,10 @@ var (
 	// InvalidWebhook defines a diag.MessageType for message "InvalidWebhook".
 	// Description: Webhook is invalid or references a control plane service that does not exist.
 	InvalidWebhook = diag.NewMessageType(diag.Error, "IST0139", "%v")
+
+	// IngressRouteRulesNotAffected defines a diag.MessageType for message "IngressRouteRulesNotAffected".
+	// Description: Route rules have no effect on ingress gateway requests
+	IngressRouteRulesNotAffected = diag.NewMessageType(diag.Warning, "IST0140", "Subset in virtual service %s has no effect on ingress gateway %s requests")
 )
 
 // All returns a list of all known message types.
@@ -193,6 +197,7 @@ func All() []*diag.MessageType {
 		DeploymentConflictingPorts,
 		GatewayDuplicateCertificate,
 		InvalidWebhook,
+		IngressRouteRulesNotAffected,
 	}
 }
 
@@ -555,5 +560,15 @@ func NewInvalidWebhook(r *resource.Instance, error string) diag.Message {
 		InvalidWebhook,
 		r,
 		error,
+	)
+}
+
+// NewIngressRouteRulesNotAffected returns a new diag.Message based on IngressRouteRulesNotAffected.
+func NewIngressRouteRulesNotAffected(r *resource.Instance, virtualservicesubset string, virtualservice string) diag.Message {
+	return diag.NewMessage(
+		IngressRouteRulesNotAffected,
+		r,
+		virtualservicesubset,
+		virtualservice,
 	)
 }
