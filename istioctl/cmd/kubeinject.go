@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/util/podutils"
 
@@ -95,8 +96,7 @@ func (e ExternalInjector) Inject(pod *corev1.Pod) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot attach to %T: %v", svc, err)
 		}
-		sortBy := func(pods []*corev1.Pod) sort.Interface { return sort.Reverse(podutils.ActivePods(pods)) }
-		pod, _, err := polymorphichelpers.GetFirstPod(e.client.CoreV1(), namespace, selector.String(), timeout, sortBy)
+		pod, err := GetFirstPod(e.client.CoreV1(), namespace, selector.String())
 		if err != nil {
 			return nil, err
 		}
@@ -191,6 +191,29 @@ var (
 	codecs       = serializer.NewCodecFactory(runtimeScheme)
 	deserializer = codecs.UniversalDeserializer()
 )
+
+// GetFirstPod returns a pod matching the namespace and label selector
+// and the number of all pods that match the label selector.
+// This is forked from  polymorphichelpers.GetFirstPod to not watch and instead return an error if no pods are found
+func GetFirstPod(client v1.CoreV1Interface, namespace string, selector string) (*corev1.Pod, error) {
+	options := metav1.ListOptions{LabelSelector: selector}
+
+	sortBy := func(pods []*corev1.Pod) sort.Interface { return sort.Reverse(podutils.ActivePods(pods)) }
+	podList, err := client.Pods(namespace).List(context.TODO(), options)
+	if err != nil {
+		return nil, err
+	}
+	pods := []*corev1.Pod{}
+	for i := range podList.Items {
+		pod := podList.Items[i]
+		pods = append(pods, &pod)
+	}
+	if len(pods) > 0 {
+		sort.Sort(sortBy(pods))
+		return pods[0], nil
+	}
+	return nil, fmt.Errorf("no pods matching selector %q found in namespace %q", selector, namespace)
+}
 
 func createInterface(kubeconfig string) (kubernetes.Interface, error) {
 	restConfig, err := kube.BuildClientConfig(kubeconfig, configContext)
@@ -341,16 +364,6 @@ func validateFlags() error {
 func setupKubeInjectParameters(sidecarTemplate *inject.Templates, valuesConfig *string,
 	revision string) (*ExternalInjector, *meshconfig.MeshConfig, error) {
 	var err error
-	var meshConfig *meshconfig.MeshConfig
-	if meshConfigFile != "" {
-		if meshConfig, err = mesh.ReadMeshConfig(meshConfigFile); err != nil {
-			return nil, nil, err
-		}
-	} else {
-		if meshConfig, err = getMeshConfigFromConfigMap(kubeconfig, "kube-inject", revision); err != nil {
-			return nil, nil, err
-		}
-	}
 	injector := &ExternalInjector{nil, nil}
 	if injectConfigFile != "" {
 		injectionConfig, err := ioutil.ReadFile(injectConfigFile) // nolint: vetshadow
@@ -370,6 +383,17 @@ func setupKubeInjectParameters(sidecarTemplate *inject.Templates, valuesConfig *
 			if *sidecarTemplate, err = getInjectConfigFromConfigMap(kubeconfig, revision); err != nil {
 				return nil, nil, err
 			}
+		}
+		return injector, nil, nil
+	}
+	var meshConfig *meshconfig.MeshConfig
+	if meshConfigFile != "" {
+		if meshConfig, err = mesh.ReadMeshConfig(meshConfigFile); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		if meshConfig, err = getMeshConfigFromConfigMap(kubeconfig, "kube-inject", revision); err != nil {
+			return nil, nil, err
 		}
 	}
 	if valuesFile != "" {
@@ -407,27 +431,20 @@ func injectCommand() *cobra.Command {
 
 	injectCmd := &cobra.Command{
 		Use:   "kube-inject",
-		Short: "Inject Envoy sidecar into Kubernetes pod resources",
+		Short: "Inject Istio sidecar into Kubernetes pod resources",
 		Long: `
-kube-inject manually injects the Envoy sidecar into Kubernetes
+kube-inject manually injects the Istio sidecar into Kubernetes
 workloads. Unsupported resources are left unmodified so it is safe to
 run kube-inject over a single file that contains multiple Service,
-ConfigMap, Deployment, etc. definitions for a complex application. It's
-best to do this when the resource is initially created.
+ConfigMap, Deployment, etc. definitions for a complex application. When in
+doubt re-run istioctl kube-inject on deployments to get the most up-to-date changes.
 
-k8s.io/docs/concepts/workloads/pods/pod-overview/#pod-templates is
-updated for Job, DaemonSet, ReplicaSet, Pod and Deployment YAML resource
-documents. Support for additional pod-based resource types can be
-added as necessary.
-
-The Istio project is continually evolving so the Istio sidecar
-configuration may change unannounced. When in doubt re-run istioctl
-kube-inject on deployments to get the most up-to-date changes.
+It's best to do kube-inject when the resource is initially created.
 `,
 		Example: `  # Update resources on the fly before applying.
   kubectl apply -f <(istioctl kube-inject -f <resource.yaml>)
 
-  # Create a persistent version of the deployment with Envoy sidecar injected.
+  # Create a persistent version of the deployment with Istio sidecar injected.
   istioctl kube-inject -f deployment.yaml -o deployment-injected.yaml
 
   # Update an existing deployment.
@@ -493,12 +510,17 @@ kube-inject on deployments to get the most up-to-date changes.
 			var valuesConfig string
 			var sidecarTemplate inject.Templates
 			var meshConfig *meshconfig.MeshConfig
-			injector, meshConfig, err := setupKubeInjectParameters(&sidecarTemplate, &valuesConfig, opts.Revision)
+			rev := opts.Revision
+			// if the revision is "default", render templates with an empty revision
+			if rev == defaultRevisionName {
+				rev = ""
+			}
+			injector, meshConfig, err := setupKubeInjectParameters(&sidecarTemplate, &valuesConfig, rev)
 			if err != nil {
 				return err
 			}
 			var warnings []string
-			retval := inject.IntoResourceFile(injector, sidecarTemplate, valuesConfig, opts.Revision, meshConfig,
+			retval := inject.IntoResourceFile(injector, sidecarTemplate, valuesConfig, rev, meshConfig,
 				reader, writer, func(warning string) {
 					warnings = append(warnings, warning)
 				})

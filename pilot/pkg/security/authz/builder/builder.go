@@ -165,6 +165,17 @@ func (b Builder) isDryRun(policy model.AuthorizationPolicy) bool {
 	return dryRun
 }
 
+func shadowRuleStatPrefix(rule *rbacpb.RBAC) string {
+	switch rule.GetAction() {
+	case rbacpb.RBAC_ALLOW:
+		return authzmodel.RBACShadowRulesAllowStatPrefix
+	case rbacpb.RBAC_DENY:
+		return authzmodel.RBACShadowRulesDenyStatPrefix
+	default:
+		return ""
+	}
+}
+
 func (b Builder) build(policies []model.AuthorizationPolicy, action rbacpb.RBAC_Action, forTCP bool) *builtConfigs {
 	if len(policies) == 0 {
 		return nil
@@ -246,7 +257,9 @@ func (b Builder) build(policies []model.AuthorizationPolicy, action rbacpb.RBAC_
 func (b Builder) buildHTTP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, providers []string) []*httppb.HttpFilter {
 	if !b.option.IsCustomBuilder {
 		rbac := &rbachttppb.RBAC{
-			Rules: rules, ShadowRules: shadowRules, ShadowRulesStatPrefix: authzmodel.RBACShadowRulesStatPrefix,
+			Rules:                 rules,
+			ShadowRules:           shadowRules,
+			ShadowRulesStatPrefix: shadowRuleStatPrefix(shadowRules),
 		}
 		return []*httppb.HttpFilter{
 			{
@@ -272,7 +285,10 @@ func (b Builder) buildHTTP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provide
 	// can utilize these metadata to trigger the enforcement conditionally.
 	// See https://docs.google.com/document/d/1V4mCQCw7mlGp0zSQQXYoBdbKMDnkPOjeyUb85U07iSI/edit#bookmark=kix.jdq8u0an2r6s
 	// for more details.
-	rbac := &rbachttppb.RBAC{ShadowRules: rules}
+	rbac := &rbachttppb.RBAC{
+		ShadowRules:           rules,
+		ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
+	}
 	return []*httppb.HttpFilter{
 		{
 			Name:       authzmodel.RBACHTTPFilterName,
@@ -288,8 +304,10 @@ func (b Builder) buildHTTP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provide
 func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, providers []string) []*tcppb.Filter {
 	if !b.option.IsCustomBuilder {
 		rbac := &rbactcppb.RBAC{
-			Rules: rules, StatPrefix: authzmodel.RBACTCPFilterStatPrefix,
-			ShadowRules: shadowRules, ShadowRulesStatPrefix: authzmodel.RBACShadowRulesStatPrefix,
+			Rules:                 rules,
+			StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
+			ShadowRules:           shadowRules,
+			ShadowRulesStatPrefix: shadowRuleStatPrefix(shadowRules),
 		}
 		return []*tcppb.Filter{
 			{
@@ -301,7 +319,10 @@ func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provider
 
 	if extauthz, err := getExtAuthz(b.extensions, providers); err != nil {
 		b.option.Logger.AppendError(multierror.Prefix(err, "failed to parse CUSTOM action, will generate a deny all config:"))
-		rbac := &rbactcppb.RBAC{Rules: rbacDefaultDenyAll, StatPrefix: authzmodel.RBACTCPFilterStatPrefix}
+		rbac := &rbactcppb.RBAC{
+			Rules:      rbacDefaultDenyAll,
+			StatPrefix: authzmodel.RBACTCPFilterStatPrefix,
+		}
 		return []*tcppb.Filter{
 			{
 				Name:       authzmodel.RBACTCPFilterName,
@@ -312,7 +333,11 @@ func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, provider
 		b.option.Logger.AppendDebugf("ignored CUSTOM action with HTTP provider on TCP filter chain")
 		return nil
 	} else {
-		rbac := &rbactcppb.RBAC{ShadowRules: rules, StatPrefix: authzmodel.RBACTCPFilterStatPrefix}
+		rbac := &rbactcppb.RBAC{
+			ShadowRules:           rules,
+			StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
+			ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
+		}
 		return []*tcppb.Filter{
 			{
 				Name:       authzmodel.RBACTCPFilterName,

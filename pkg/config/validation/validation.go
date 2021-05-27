@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	udpaa "github.com/cncf/udpa/go/udpa/annotations"
+	udpaa "github.com/cncf/xds/go/udpa/annotations"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
@@ -189,8 +189,16 @@ func checkDryRunAnnotation(cfg config.Config, allowed bool) error {
 		if !allowed {
 			return fmt.Errorf("%s/%s has unsupported annotation %s, please remove the annotation", cfg.Namespace, cfg.Name, annotation.IoIstioDryRun.Name)
 		}
-		if _, err := strconv.ParseBool(val); err != nil {
-			return fmt.Errorf("%s/%s has annotation %s with invalid value (%s): %v", cfg.Namespace, cfg.Name, annotation.IoIstioDryRun.Name, val, err)
+		if spec, ok := cfg.Spec.(*security_beta.AuthorizationPolicy); ok {
+			switch spec.Action {
+			case security_beta.AuthorizationPolicy_ALLOW, security_beta.AuthorizationPolicy_DENY:
+				if _, err := strconv.ParseBool(val); err != nil {
+					return fmt.Errorf("%s/%s has annotation %s with invalid value (%s): %v", cfg.Namespace, cfg.Name, annotation.IoIstioDryRun.Name, val, err)
+				}
+			default:
+				return fmt.Errorf("the annotation %s currently only supports action ALLOW/DENY, found action %v in %s/%s",
+					annotation.IoIstioDryRun.Name, spec.Action, cfg.Namespace, cfg.Name)
+			}
 		}
 	}
 	return nil
@@ -278,6 +286,32 @@ func ValidateTrustDomain(domain string) error {
 func ValidateHTTPHeaderName(name string) error {
 	if name == "" {
 		return fmt.Errorf("header name cannot be empty")
+	}
+	return nil
+}
+
+// ValidateHTTPHeaderWithAuthorityOperationName validates a header name when used to add/set in request.
+func ValidateHTTPHeaderWithAuthorityOperationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	// Authority header is validated later
+	if isInternalHeader(name) && !isAuthorityHeader(name) {
+		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
+	}
+	return nil
+}
+
+// ValidateHTTPHeaderOperationName validates a header name when used to remove from request or modify response.
+func ValidateHTTPHeaderOperationName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	if strings.EqualFold(name, "host") {
+		return fmt.Errorf(`invalid header %q: cannot set Host header`, name)
+	}
+	if isInternalHeader(name) {
+		return fmt.Errorf(`invalid header %q: header cannot have ":" prefix`, name)
 	}
 	return nil
 }
@@ -913,10 +947,10 @@ var ValidateSidecar = registerValidateFunc("ValidateSidecar",
 					// format should be 127.0.0.1:port or :port
 					parts := strings.Split(i.DefaultEndpoint, ":")
 					if len(parts) < 2 {
-						errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port> or 0.0.0.0:<port>"))
+						errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port>, 0.0.0.0:<port>, unix://filepath, or unset"))
 					} else {
 						if len(parts[0]) > 0 && parts[0] != "127.0.0.1" && parts[0] != "0.0.0.0" {
-							errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port> or 0.0.0.0:<port>"))
+							errs = appendErrors(errs, fmt.Errorf("sidecar: defaultEndpoint must be of form 127.0.0.1:<port>, 0.0.0.0:<port>, unix://filepath, or unset"))
 						}
 
 						port, err := strconv.Atoi(parts[1])
@@ -1087,6 +1121,10 @@ func validateOutlierDetection(outlier *networking.OutlierDetection) (errs Valida
 		warn := "outlier detection consecutive errors is deprecated, use consecutiveGatewayErrors or consecutive5xxErrors instead"
 		scope.Warnf(warn)
 		errs = appendValidation(errs, WrapWarning(errors.New(warn)))
+	}
+	if !outlier.SplitExternalLocalOriginErrors && outlier.ConsecutiveLocalOriginFailures.GetValue() > 0 {
+		err := "outlier detection consecutive local origin failures is specified, but split external local origin errors is set to false"
+		errs = appendValidation(errs, errors.New(err))
 	}
 	if outlier.Interval != nil {
 		errs = appendValidation(errs, ValidateDurationGogo(outlier.Interval))
@@ -2203,26 +2241,26 @@ func validateHTTPRouteDestinations(weights []*networking.HTTPRouteDestination) (
 
 		// header manipulations
 		for name, val := range weight.Headers.GetRequest().GetAdd() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for name, val := range weight.Headers.GetRequest().GetSet() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for _, name := range weight.Headers.GetRequest().GetRemove() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 		}
 		for name, val := range weight.Headers.GetResponse().GetAdd() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for name, val := range weight.Headers.GetResponse().GetSet() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 			errs = appendErrors(errs, ValidateHTTPHeaderValue(val))
 		}
 		for _, name := range weight.Headers.GetResponse().GetRemove() {
-			errs = appendErrors(errs, ValidateHTTPHeaderName(name))
+			errs = appendErrors(errs, ValidateHTTPHeaderOperationName(name))
 		}
 
 		errs = appendErrors(errs, validateDestination(weight.Destination))
@@ -2465,7 +2503,7 @@ func validateHTTPRewrite(rewrite *networking.HTTPRewrite) error {
 
 // ValidateWorkloadEntry validates a workload entry.
 var ValidateWorkloadEntry = registerValidateFunc("ValidateWorkloadEntry",
-	func(cfg config.Config) (warnings Warning, errs error) {
+	func(cfg config.Config) (Warning, error) {
 		we, ok := cfg.Spec.(*networking.WorkloadEntry)
 		if !ok {
 			return nil, fmt.Errorf("cannot cast to workload entry")
@@ -2473,13 +2511,40 @@ var ValidateWorkloadEntry = registerValidateFunc("ValidateWorkloadEntry",
 		return validateWorkloadEntry(we)
 	})
 
-func validateWorkloadEntry(we *networking.WorkloadEntry) (warnings Warning, errs error) {
+func validateWorkloadEntry(we *networking.WorkloadEntry) (Warning, error) {
+	errs := Validation{}
 	if we.Address == "" {
 		return nil, fmt.Errorf("address must be set")
 	}
-	// TODO: add better validation. The tricky thing is that we don't know if its meant to be
-	// DNS or STATIC type without association with a ServiceEntry
-	return nil, nil
+	// Since we don't know if its meant to be DNS or STATIC type without association with a ServiceEntry,
+	// check based on content and try validations.
+	addr := we.Address
+	// First check if it is a Unix endpoint - this will be specified for STATIC.
+	if strings.HasPrefix(we.Address, UnixAddressPrefix) {
+		errs = appendValidation(errs, ValidateUnixAddress(strings.TrimPrefix(addr, UnixAddressPrefix)))
+		if len(we.Ports) != 0 {
+			errs = appendValidation(errs, fmt.Errorf("unix endpoint %s must not include ports", we.Address))
+		}
+	} else {
+		// This could be IP (in STATIC resolution) or DNS host name (for DNS).
+		ipAddr := net.ParseIP(we.Address)
+		if ipAddr == nil {
+			if err := ValidateFQDN(we.Address); err != nil { // Otherwise could be an FQDN
+				errs = appendValidation(errs,
+					fmt.Errorf("endpoint address %q is not a valid FQDN or an IP address", we.Address))
+			}
+		}
+	}
+
+	errs = appendValidation(errs,
+		labels.Instance(we.Labels).Validate())
+	for name, port := range we.Ports {
+		// TODO: Validate port is part of Service Port - which is tricky to validate with out service entry.
+		errs = appendValidation(errs,
+			ValidatePortName(name),
+			ValidatePort(int(port)))
+	}
+	return errs.Unwrap()
 }
 
 // ValidateWorkloadGroup validates a workload group.

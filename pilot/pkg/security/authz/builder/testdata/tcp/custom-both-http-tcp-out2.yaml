@@ -5,7 +5,7 @@ typedConfig:
   filterEnabledMetadata:
     filter: envoy.filters.network.rbac
     path:
-    - key: shadow_effective_policy_id
+    - key: istio_ext_authz_shadow_effective_policy_id
     value:
       stringMatch:
         prefix: istio-ext-authz
@@ -13,6 +13,6 @@ typedConfig:
     envoyGrpc:
       authority: outbound_.9000_._.my-custom-ext-authz.foo.svc.cluster.local
       clusterName: outbound|9000||my-custom-ext-authz.foo.svc.cluster.local
-    timeout: 600s
+    timeout: 0.002s
   statPrefix: tcp.
   transportApiVersion: V3

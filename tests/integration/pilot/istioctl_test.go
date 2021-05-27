@@ -164,7 +164,7 @@ func TestDescribe(t *testing.T) {
 					return fmt.Errorf("output:\n%v\n does not match regex:\n%v", output, describeSvcAOutput)
 				}
 				return nil
-			}, retry.Timeout(time.Second*5))
+			}, retry.Timeout(time.Second*20))
 
 			retry.UntilSuccessOrFail(t, func() error {
 				podID, err := getPodID(apps.PodA[0])
@@ -183,7 +183,7 @@ func TestDescribe(t *testing.T) {
 					return fmt.Errorf("output:\n%v\n does not match regex:\n%v", output, describePodAOutput)
 				}
 				return nil
-			}, retry.Timeout(time.Second*5))
+			}, retry.Timeout(time.Second*20))
 		})
 }
 
@@ -245,7 +245,7 @@ func TestAddToAndRemoveFromMesh(t *testing.T) {
 					}
 				}
 				return nil
-			}, retry.Delay(time.Second))
+			}, retry.Delay(time.Second), retry.Timeout(time.Minute))
 
 			args = []string{
 				fmt.Sprintf("--namespace=%s", ns.Name()),
@@ -525,7 +525,7 @@ func TestKubeInject(t *testing.T) {
 		Run(func(t framework.TestContext) {
 			istioCtl := istioctl.NewOrFail(t, t, istioctl.Config{})
 			var output string
-			args := []string{"kube-inject", "-f", "testdata/hello.yaml"}
+			args := []string{"kube-inject", "-f", "testdata/hello.yaml", "--revision=" + t.Settings().Revision}
 			output, _ = istioCtl.InvokeOrFail(t, args)
 			if !strings.Contains(output, "istio-proxy") {
 				t.Fatal("istio-proxy has not been injected")

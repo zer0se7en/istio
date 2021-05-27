@@ -17,6 +17,7 @@ package apigen
 import (
 	"strings"
 
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	gogotypes "github.com/gogo/protobuf/types"
 	golangany "github.com/golang/protobuf/ptypes/any"
 
@@ -55,8 +56,9 @@ type APIGenerator struct{}
 // This provides similar functionality with MCP and :8080/debug/configz.
 //
 // Names are based on the current resource naming in istiod stores.
-func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates *model.PushRequest) (model.Resources, error) {
-	resp := []*golangany.Any{}
+func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource,
+	updates *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
+	resp := model.Resources{}
 
 	// Note: this is the style used by MCP and its config. Pilot is using 'Group/Version/Kind' as the
 	// key, which is similar.
@@ -68,7 +70,7 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 	if len(kind) != 3 {
 		log.Warnf("ADS: Unknown watched resources %s", w.TypeUrl)
 		// Still return an empty response - to not break waiting code. It is fine to not know about some resource.
-		return resp, nil
+		return resp, model.DefaultXdsLogDetails, nil
 	}
 	// TODO: extra validation may be needed - at least logging that a resource
 	// of unknown type was requested. This should not be an error - maybe client asks
@@ -81,12 +83,15 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 	if w.TypeUrl == collections.IstioMeshV1Alpha1MeshConfig.Resource().GroupVersionKind().String() {
 		meshAny, err := gogotypes.MarshalAny(push.Mesh)
 		if err == nil {
-			resp = append(resp, &golangany.Any{
+			a := &golangany.Any{
 				TypeUrl: meshAny.TypeUrl,
 				Value:   meshAny.Value,
+			}
+			resp = append(resp, &discovery.Resource{
+				Resource: a,
 			})
 		}
-		return resp, nil
+		return resp, model.DefaultXdsLogDetails, nil
 	}
 
 	// TODO: what is the proper way to handle errors ?
@@ -97,7 +102,7 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 	cfg, err := push.IstioConfigStore.List(rgvk, "")
 	if err != nil {
 		log.Warnf("ADS: Error reading resource %s %v", w.TypeUrl, err)
-		return resp, nil
+		return resp, model.DefaultXdsLogDetails, nil
 	}
 	for _, c := range cfg {
 		// Right now model.Config is not a proto - until we change it, mcp.Resource.
@@ -110,9 +115,13 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 		}
 		bany, err := gogotypes.MarshalAny(b)
 		if err == nil {
-			resp = append(resp, &golangany.Any{
+			a := &golangany.Any{
 				TypeUrl: bany.TypeUrl,
 				Value:   bany.Value,
+			}
+			resp = append(resp, &discovery.Resource{
+				Name:     c.Namespace + "/" + c.Name,
+				Resource: a,
 			})
 		} else {
 			log.Warn("Any ", err)
@@ -138,9 +147,13 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 			}
 			bany, err := gogotypes.MarshalAny(b)
 			if err == nil {
-				resp = append(resp, &golangany.Any{
+				a := &golangany.Any{
 					TypeUrl: bany.TypeUrl,
 					Value:   bany.Value,
+				}
+				resp = append(resp, &discovery.Resource{
+					Name:     c.Namespace + "/" + c.Name,
+					Resource: a,
 				})
 			} else {
 				log.Warn("Any ", err)
@@ -148,7 +161,7 @@ func (g *APIGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *
 		}
 	}
 
-	return resp, nil
+	return resp, model.DefaultXdsLogDetails, nil
 }
 
 // Convert from model.Config, which has no associated proto, to MCP Resource proto.

@@ -989,6 +989,10 @@ func (ps *PushContext) createNewContext(env *Environment) error {
 		return err
 	}
 
+	if err := ps.initKubernetesGateways(env); err != nil {
+		return err
+	}
+
 	if err := ps.initVirtualServices(env); err != nil {
 		return err
 	}
@@ -1030,7 +1034,7 @@ func (ps *PushContext) updateContext(
 	oldPushContext *PushContext,
 	pushReq *PushRequest) error {
 	var servicesChanged, virtualServicesChanged, destinationRulesChanged, gatewayChanged,
-		authnChanged, authzChanged, envoyFiltersChanged, sidecarsChanged, telemetryChanged bool
+		authnChanged, authzChanged, envoyFiltersChanged, sidecarsChanged, telemetryChanged, gatewayAPIChanged bool
 
 	for conf := range pushReq.ConfigsUpdated {
 		switch conf.Kind {
@@ -1052,6 +1056,7 @@ func (ps *PushContext) updateContext(
 			gvk.PeerAuthentication:
 			authnChanged = true
 		case gvk.HTTPRoute, gvk.TCPRoute, gvk.GatewayClass, gvk.ServiceApisGateway, gvk.TLSRoute:
+			gatewayAPIChanged = true
 			virtualServicesChanged = true
 			gatewayChanged = true
 		case gvk.Telemetry:
@@ -1068,6 +1073,12 @@ func (ps *PushContext) updateContext(
 		// make sure we copy over things that would be generated in initServiceRegistry
 		ps.ServiceIndex = oldPushContext.ServiceIndex
 		ps.ServiceAccounts = oldPushContext.ServiceAccounts
+	}
+
+	if gatewayAPIChanged {
+		if err := ps.initKubernetesGateways(env); err != nil {
+			return err
+		}
 	}
 
 	if virtualServicesChanged {
@@ -1269,7 +1280,7 @@ func (ps *PushContext) initVirtualServices(env *Environment) error {
 	for _, virtualService := range vservices {
 		ns := virtualService.Namespace
 		rule := virtualService.Spec.(*networking.VirtualService)
-		gwNames := getGatewayNames(rule, virtualService.Meta)
+		gwNames := getGatewayNames(rule)
 		if len(rule.ExportTo) == 0 {
 			// No exportTo in virtualService. Use the global default
 			// We only honor ., *
@@ -1333,7 +1344,7 @@ func (ps *PushContext) initVirtualServices(env *Environment) error {
 
 var meshGateways = []string{constants.IstioMeshGateway}
 
-func getGatewayNames(vs *networking.VirtualService, meta config.Meta) []string {
+func getGatewayNames(vs *networking.VirtualService) []string {
 	if len(vs.Gateways) == 0 {
 		return meshGateways
 	}
@@ -1342,8 +1353,7 @@ func getGatewayNames(vs *networking.VirtualService, meta config.Meta) []string {
 		if g == constants.IstioMeshGateway {
 			res = append(res, constants.IstioMeshGateway)
 		} else {
-			name := resolveGatewayName(g, meta)
-			res = append(res, name)
+			res = append(res, g)
 		}
 	}
 	return res
@@ -1429,10 +1439,10 @@ func (ps *PushContext) initSidecarScopes(env *Environment) error {
 	// Currently we expect that it has no workloadSelectors
 	var rootNSConfig *config.Config
 	if ps.Mesh.RootNamespace != "" {
-		for _, sidecarConfig := range sidecarConfigs {
+		for i, sidecarConfig := range sidecarConfigs {
 			if sidecarConfig.Namespace == ps.Mesh.RootNamespace &&
 				sidecarConfig.Spec.(*networking.Sidecar).WorkloadSelector == nil {
-				rootNSConfig = &sidecarConfig
+				rootNSConfig = &sidecarConfigs[i]
 				break
 			}
 		}
@@ -1834,4 +1844,12 @@ func (ps *PushContext) ServiceInstancesByPort(svc *Service, port int, labels lab
 
 	// Fallback to discovery call.
 	return ps.InstancesByPort(svc, port, labels)
+}
+
+// initKubernetesGateways initializes Kubernetes gateway-api objects
+func (ps *PushContext) initKubernetesGateways(env *Environment) error {
+	if env.GatewayAPIController != nil {
+		return env.GatewayAPIController.Recompute()
+	}
+	return nil
 }

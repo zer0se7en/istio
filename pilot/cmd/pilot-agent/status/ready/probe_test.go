@@ -15,6 +15,8 @@
 package ready
 
 import (
+	"context"
+	"net"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -32,13 +34,30 @@ var (
 func TestEnvoyStatsCompleteAndSuccessful(t *testing.T) {
 	g := NewWithT(t)
 
-	server := testserver.CreateAndStartServer(liveServerStats, "127.0.0.1:1234")
+	server := testserver.CreateAndStartServer(liveServerStats)
 	defer server.Close()
-	probe := Probe{AdminPort: 1234}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 
 	err := probe.Check()
 
 	g.Expect(err).NotTo(HaveOccurred())
+}
+
+func TestEnvoyDraining(t *testing.T) {
+	g := NewWithT(t)
+
+	server := testserver.CreateAndStartServer(liveServerStats)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port), Context: ctx}
+	cancel()
+
+	err := probe.isEnvoyReady()
+
+	g.Expect(err).To(HaveOccurred())
 }
 
 func TestEnvoyStats(t *testing.T) {
@@ -86,10 +105,12 @@ server.state: 0`,
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			server := testserver.CreateAndStartServer(tt.stats, "127.0.0.1:1234")
+			server := testserver.CreateAndStartServer(tt.stats)
 			defer server.Close()
-			probe := Probe{AdminPort: 1234}
-
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+			probe.Context = ctx
 			err := probe.Check()
 
 			// Expect no error
@@ -110,10 +131,12 @@ server.state: 0`,
 func TestEnvoyInitializing(t *testing.T) {
 	g := NewWithT(t)
 
-	server := testserver.CreateAndStartServer(initServerStats, "127.0.0.1:1234")
+	server := testserver.CreateAndStartServer(initServerStats)
 	defer server.Close()
-	probe := Probe{AdminPort: 1234}
-
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 	err := probe.Check()
 
 	g.Expect(err).To(HaveOccurred())
@@ -122,10 +145,12 @@ func TestEnvoyInitializing(t *testing.T) {
 func TestEnvoyNoClusterManagerStats(t *testing.T) {
 	g := NewWithT(t)
 
-	server := testserver.CreateAndStartServer(onlyServerStats, "127.0.0.1:1234")
+	server := testserver.CreateAndStartServer(onlyServerStats)
 	defer server.Close()
-	probe := Probe{AdminPort: 1234}
-
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 	err := probe.Check()
 
 	g.Expect(err).To(HaveOccurred())
@@ -134,10 +159,12 @@ func TestEnvoyNoClusterManagerStats(t *testing.T) {
 func TestEnvoyNoServerStats(t *testing.T) {
 	g := NewWithT(t)
 
-	server := testserver.CreateAndStartServer(noServerStats, "127.0.0.1:1234")
+	server := testserver.CreateAndStartServer(noServerStats)
 	defer server.Close()
-	probe := Probe{AdminPort: 1234}
-
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 	err := probe.Check()
 
 	g.Expect(err).To(HaveOccurred())
@@ -146,8 +173,11 @@ func TestEnvoyNoServerStats(t *testing.T) {
 func TestEnvoyReadinessCache(t *testing.T) {
 	g := NewWithT(t)
 
-	server := testserver.CreateAndStartServer(noServerStats, "127.0.0.1:1234")
-	probe := Probe{AdminPort: 1234}
+	server := testserver.CreateAndStartServer(noServerStats)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{AdminPort: uint16(server.Listener.Addr().(*net.TCPAddr).Port)}
+	probe.Context = ctx
 	err := probe.Check()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(probe.atleastOnceReady).Should(BeFalse())
@@ -156,13 +186,15 @@ func TestEnvoyReadinessCache(t *testing.T) {
 	g.Expect(probe.atleastOnceReady).Should(BeFalse())
 	server.Close()
 
-	server = testserver.CreateAndStartServer(liveServerStats, "127.0.0.1:1234")
+	server = testserver.CreateAndStartServer(liveServerStats)
+	probe.AdminPort = uint16(server.Listener.Addr().(*net.TCPAddr).Port)
 	err = probe.Check()
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(probe.atleastOnceReady).Should(BeTrue())
 	server.Close()
 
-	server = testserver.CreateAndStartServer(noServerStats, "127.0.0.1:1234")
+	server = testserver.CreateAndStartServer(noServerStats)
+	probe.AdminPort = uint16(server.Listener.Addr().(*net.TCPAddr).Port)
 	err = probe.Check()
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(probe.atleastOnceReady).Should(BeTrue())

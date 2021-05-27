@@ -22,7 +22,7 @@ SHELL := /bin/bash -o pipefail
 export VERSION ?= 1.10-dev
 
 # Base version of Istio image to use
-BASE_VERSION ?= 1.10-dev.1
+BASE_VERSION ?= 1.10-dev.4
 
 export GO111MODULE ?= on
 export GOPROXY ?= https://proxy.golang.org
@@ -248,7 +248,7 @@ $(OUTPUT_DIRS):
 .PHONY: ${GEN_CERT}
 GEN_CERT := ${ISTIO_BIN}/generate_cert
 ${GEN_CERT}:
-	GOOS=$(GOOS_LOCAL) && GOARCH=$(GOARCH_LOCAL) && CGO_ENABLED=1 common/scripts/gobuild.sh $@ ./security/tools/generate_cert
+	GOOS=$(GOOS_LOCAL) && GOARCH=$(GOARCH_LOCAL) && common/scripts/gobuild.sh $@ ./security/tools/generate_cert
 
 #-----------------------------------------------------------------------------
 # Target: precommit
