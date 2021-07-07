@@ -18,11 +18,14 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/miekg/dns"
 
 	nds "istio.io/istio/pilot/pkg/proto"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/config/host"
 	istiolog "istio.io/pkg/log"
 )
 
@@ -32,6 +35,9 @@ var log = istiolog.RegisterScope("dns", "Istio DNS proxy", 0)
 type LocalDNSServer struct {
 	// Holds the pointer to the DNS lookup table
 	lookupTable atomic.Value
+
+	// nameTable holds the original NameTable, for debugging
+	nameTable atomic.Value
 
 	udpDNSProxy *dnsProxy
 	tcpDNSProxy *dnsProxy
@@ -76,6 +82,8 @@ func NewLocalDNSServer(proxyNamespace, proxyDomain string) (*LocalDNSServer, err
 	h := &LocalDNSServer{
 		proxyNamespace: proxyNamespace,
 	}
+
+	registerStats()
 
 	// proxyDomain could contain the namespace making it redundant.
 	// we just need the .svc.cluster.local piece
@@ -140,7 +148,7 @@ func (h *LocalDNSServer) UpdateLookupTable(nt *nds.NameTable) {
 		// if its a k8s host, store all variants (i.e. shortname+., shortname+namespace+., fqdn+., etc.)
 		// shortname+. is only for hosts in current namespace
 		var altHosts map[string]struct{}
-		if ni.Registry == "Kubernetes" {
+		if ni.Registry == string(provider.Kubernetes) {
 			altHosts = generateAltHosts(host, ni, h.proxyNamespace, h.proxyDomain, h.proxyDomainParts)
 		} else {
 			altHosts = map[string]struct{}{host + ".": {}}
@@ -153,11 +161,13 @@ func (h *LocalDNSServer) UpdateLookupTable(nt *nds.NameTable) {
 		lookupTable.buildDNSAnswers(altHosts, ipv4, ipv6, h.searchNamespaces)
 	}
 	h.lookupTable.Store(lookupTable)
+	h.nameTable.Store(nt)
 	log.Debugf("updated lookup table with %d hosts", len(lookupTable.allHosts))
 }
 
 // ServerDNS is the implementation of DNS interface
 func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dns.Msg) {
+	requests.Increment()
 	var response *dns.Msg
 	log := log.WithLabels("protocol", proxy.protocol, "edns", req.IsEdns0() != nil)
 	if log.DebugEnabled() {
@@ -208,9 +218,12 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 		roundRobinResponse(response)
 		log.Debugf("response for hostname %q (found=true): %v", hostname, response)
 	} else {
+		upstreamRequests.Increment()
+		start := time.Now()
 		// We did not find the host in our internal cache. Query upstream and return the response as is.
 		log.Debugf("response for hostname %q not found in dns proxy, querying upstream", hostname)
 		response = h.queryUpstream(proxy.upstreamClient, req, log)
+		requestDuration.Record(time.Since(start).Seconds())
 		log.Debugf("upstream response for hostname %q : %v", hostname, response)
 	}
 	// Compress the response - we don't know if the incoming response was compressed or not. If it was,
@@ -223,6 +236,14 @@ func (h *LocalDNSServer) ServeDNS(proxy *dnsProxy, w dns.ResponseWriter, req *dn
 // IsReady returns true if DNS lookup table is updated atleast once.
 func (h *LocalDNSServer) IsReady() bool {
 	return h.lookupTable.Load() != nil
+}
+
+func (h *LocalDNSServer) NameTable() *nds.NameTable {
+	lt := h.nameTable.Load()
+	if lt == nil {
+		return nil
+	}
+	return lt.(*nds.NameTable)
 }
 
 // Inspired by https://github.com/coredns/coredns/blob/master/plugin/loadbalance/loadbalance.go
@@ -305,6 +326,7 @@ func (h *LocalDNSServer) queryUpstream(upstreamClient *dns.Client, req *dns.Msg,
 		}
 	}
 	if response == nil {
+		failures.Increment()
 		response = new(dns.Msg)
 		response.SetReply(req)
 		response.Rcode = dns.RcodeServerFailure
@@ -354,8 +376,27 @@ func generateAltHosts(hostname string, nameinfo *nds.NameTable_NameInfo, proxyNa
 // of registry, we will look it up in one of our tables, failing which we will return NXDOMAIN.
 func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, bool) {
 	var hostFound bool
-	if _, hostFound = table.allHosts[hostname]; !hostFound {
-		// this is not from our registry
+
+	question := host.Name(hostname)
+	wildcard := false
+	// First check if host exists in all hosts.
+	_, hostFound = table.allHosts[hostname]
+	// If it is not found, check if a wildcard host exists for it.
+	// For example for "*.example.com", with the question "svc.svcns.example.com",
+	// we check if we have entries for "*.svcns.example.com", "*.example.com" etc.
+	if !hostFound {
+		labels := dns.SplitDomainName(hostname)
+		for idx := range labels {
+			qhost := "*." + strings.Join(labels[idx+1:], ".") + "."
+			if _, hostFound = table.allHosts[qhost]; hostFound {
+				wildcard = true
+				hostname = qhost
+				break
+			}
+		}
+	}
+
+	if !hostFound {
 		return nil, false
 	}
 
@@ -380,6 +421,12 @@ func (table *LookupTable) lookupHost(qtype uint16, hostname string) ([]dns.RR, b
 	}
 
 	if len(ipAnswers) > 0 {
+		// For wildcard hosts, set the host that is being queried for.
+		if wildcard {
+			for _, answer := range ipAnswers {
+				answer.Header().Name = string(question)
+			}
+		}
 		// We will return a chained response. In a chained response, the first entry is the cname record,
 		// and the second one is the A/AAAA record itself. Some clients do not follow cname redirects
 		// with additional DNS queries. Instead, they expect all the resolved records to be in the same

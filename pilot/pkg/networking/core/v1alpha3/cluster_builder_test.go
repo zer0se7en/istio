@@ -38,12 +38,16 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 	authn_model "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/test/xdstest"
+	cluster2 "istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/util/identifier"
 )
 
 func TestApplyDestinationRule(t *testing.T) {
@@ -65,7 +69,7 @@ func TestApplyDestinationRule(t *testing.T) {
 	service := &model.Service{
 		Hostname:    host.Name("foo.default.svc.cluster.local"),
 		Address:     "1.1.1.1",
-		ClusterVIPs: make(map[string]string),
+		ClusterVIPs: make(map[cluster2.ID]string),
 		Ports:       servicePort,
 		Resolution:  model.ClientSideLB,
 		Attributes:  serviceAttribute,
@@ -77,7 +81,7 @@ func TestApplyDestinationRule(t *testing.T) {
 		clusterMode            ClusterMode
 		service                *model.Service
 		port                   *model.Port
-		networkView            map[string]bool
+		networkView            map[network.ID]bool
 		destRule               *networking.DestinationRule
 		expectedSubsetClusters []*cluster.Cluster
 	}{
@@ -88,7 +92,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode:            DefaultClusterMode,
 			service:                &model.Service{},
 			port:                   &model.Port{},
-			networkView:            map[string]bool{},
+			networkView:            map[network.ID]bool{},
 			destRule:               nil,
 			expectedSubsetClusters: []*cluster.Cluster{},
 		},
@@ -98,7 +102,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode: DefaultClusterMode,
 			service:     service,
 			port:        servicePort[0],
-			networkView: map[string]bool{},
+			networkView: map[network.ID]bool{},
 			destRule: &networking.DestinationRule{
 				Host: "foo.default.svc.cluster.local",
 				Subsets: []*networking.Subset{
@@ -124,7 +128,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode: DefaultClusterMode,
 			service:     service,
 			port:        servicePort[0],
-			networkView: map[string]bool{},
+			networkView: map[network.ID]bool{},
 			destRule: &networking.DestinationRule{
 				Host: "foo.default.svc.cluster.local",
 				Subsets: []*networking.Subset{
@@ -152,7 +156,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode: SniDnatClusterMode,
 			service:     service,
 			port:        servicePort[0],
-			networkView: map[string]bool{},
+			networkView: map[network.ID]bool{},
 			destRule: &networking.DestinationRule{
 				Host: "foo.default.svc.cluster.local",
 				Subsets: []*networking.Subset{
@@ -178,7 +182,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode: DefaultClusterMode,
 			service:     service,
 			port:        servicePort[0],
-			networkView: map[string]bool{},
+			networkView: map[network.ID]bool{},
 			destRule: &networking.DestinationRule{
 				Host: "foo.default.svc.cluster.local",
 				Subsets: []*networking.Subset{
@@ -220,7 +224,7 @@ func TestApplyDestinationRule(t *testing.T) {
 			clusterMode: DefaultClusterMode,
 			service:     service,
 			port:        servicePort[0],
-			networkView: map[string]bool{},
+			networkView: map[network.ID]bool{},
 			destRule: &networking.DestinationRule{
 				Host: "foo.default.svc.cluster.local",
 				TrafficPolicy: &networking.TrafficPolicy{
@@ -797,7 +801,8 @@ func TestBuildDefaultCluster(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			cg := NewConfigGenTest(t, TestOptions{MeshConfig: &testMesh})
+			mesh := testMesh()
+			cg := NewConfigGenTest(t, TestOptions{MeshConfig: &mesh})
 			cb := NewClusterBuilder(cg.SetupProxy(nil), cg.PushContext())
 			service := &model.Service{
 				Ports: model.PortList{
@@ -831,7 +836,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 	service := &model.Service{
 		Hostname:    host.Name("*.example.org"),
 		Address:     "1.1.1.1",
-		ClusterVIPs: make(map[string]string),
+		ClusterVIPs: make(map[cluster2.ID]string),
 		Ports:       model.PortList{servicePort},
 		Resolution:  model.DNSLB,
 		Attributes: model.ServiceAttributes{
@@ -848,7 +853,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 	}{
 		{
 			name: "basics",
-			mesh: testMesh,
+			mesh: testMesh(),
 			instances: []*model.ServiceInstance{
 				{
 					Service:     service,
@@ -1004,7 +1009,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 		},
 		{
 			name: "cluster local",
-			mesh: withClusterLocalHosts(testMesh, "*.example.org"),
+			mesh: withClusterLocalHosts(testMesh(), "*.example.org"),
 			instances: []*model.ServiceInstance{
 				{
 					Service:     service,
@@ -1091,10 +1096,10 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 			})
 
 			cb := NewClusterBuilder(cg.SetupProxy(proxy), cg.PushContext())
-			nv := map[string]bool{
+			nv := map[network.ID]bool{
 				"nw-0":               true,
 				"nw-1":               true,
-				model.UnnamedNetwork: true,
+				identifier.Undefined: true,
 			}
 			actual := cb.buildLocalityLbEndpoints(nv, service, 8080, nil)
 			sortEndpoints(actual)
@@ -1712,6 +1717,53 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 						ValidationContextType: &tls.CommonTlsContext_CombinedValidationContext{
 							CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
 								DefaultValidationContext: &tls.CertificateValidationContext{MatchSubjectAltNames: util.StringToExactMatch([]string{"SAN"})},
+								ValidationContextSdsSecretConfig: &tls.SdsSecretConfig{
+									Name: fmt.Sprintf("file-root:%s", rootCert),
+									SdsConfig: &core.ConfigSource{
+										ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+											ApiConfigSource: &core.ApiConfigSource{
+												ApiType:                   core.ApiConfigSource_GRPC,
+												SetNodeOnFirstMessageOnly: true,
+												TransportApiVersion:       core.ApiVersion_V3,
+												GrpcServices: []*core.GrpcService{
+													{
+														TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+															EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: "sds-grpc"},
+														},
+													},
+												},
+											},
+										},
+										ResourceApiVersion: core.ApiVersion_V3,
+									},
+								},
+							},
+						},
+					},
+					Sni: "some-sni.com",
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "tls mode SIMPLE, with SANs specified in service entries",
+			opts: &buildClusterOpts{
+				mutable:         newTestCluster(),
+				proxy:           &model.Proxy{},
+				serviceAccounts: []string{"se-san.com"},
+				serviceRegistry: provider.External,
+			},
+			tls: &networking.ClientTLSSettings{
+				Mode:           networking.ClientTLSSettings_SIMPLE,
+				CaCertificates: rootCert,
+				Sni:            "some-sni.com",
+			},
+			result: expectedResult{
+				tlsContext: &tls.UpstreamTlsContext{
+					CommonTlsContext: &tls.CommonTlsContext{
+						ValidationContextType: &tls.CommonTlsContext_CombinedValidationContext{
+							CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
+								DefaultValidationContext: &tls.CertificateValidationContext{MatchSubjectAltNames: util.StringToExactMatch([]string{"se-san.com"})},
 								ValidationContextSdsSecretConfig: &tls.SdsSecretConfig{
 									Name: fmt.Sprintf("file-root:%s", rootCert),
 									SdsConfig: &core.ConfigSource{

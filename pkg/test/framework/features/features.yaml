@@ -49,7 +49,10 @@ features:
       envoy:
     original-source-ip:
     mcs:
-      serviceexport:
+      autoexport:
+      servicediscovery:
+    cni:
+      race-condition-repair:
   usability:
     observability:
       describe:
@@ -121,6 +124,10 @@ features:
         jwt:
         webhook:
       plugin-cert:
+    normalization:
+    fuzz:
+      authorization:
+      jwt:
   # features which allow extending or deep integrations with istio and other products
   extensibility:
     wasm:

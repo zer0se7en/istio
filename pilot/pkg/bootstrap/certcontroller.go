@@ -129,18 +129,18 @@ func (s *Server) initDNSCerts(hostname, customHost, namespace string) error {
 
 	var certChain, keyPEM, caBundle []byte
 	var err error
-	if features.PilotCertProvider.Get() == constants.CertProviderKubernetes {
+	if features.PilotCertProvider == constants.CertProviderKubernetes {
 		log.Infof("Generating K8S-signed cert for %v", names)
 		certChain, keyPEM, _, err = chiron.GenKeyCertK8sCA(s.kubeClient.CertificatesV1beta1().CertificateSigningRequests(),
-			strings.Join(names, ","), hostnamePrefix+".csr.secret", namespace, defaultCACertPath)
+			strings.Join(names, ","), hostnamePrefix+".csr.secret", namespace, defaultCACertPath, "")
 		if err != nil {
-			return fmt.Errorf("failed genrating ker cert by k8s: %v", err)
+			return fmt.Errorf("failed generating key and cert by kubernetes: %v", err)
 		}
 		caBundle, err = ioutil.ReadFile(defaultCACertPath)
 		if err != nil {
 			return fmt.Errorf("failed reading %s: %v", defaultCACertPath, err)
 		}
-	} else if features.PilotCertProvider.Get() == constants.CertProviderIstiod {
+	} else if features.PilotCertProvider == constants.CertProviderIstiod {
 		certChain, keyPEM, err = s.CA.GenKeyCert(names, SelfSignedCACertTTL.Get(), false)
 		if err != nil {
 			return fmt.Errorf("failed generating istiod key cert %v", err)
@@ -169,7 +169,7 @@ func (s *Server) initDNSCerts(hostname, customHost, namespace string) error {
 	} else {
 		customCACertPath := security.DefaultRootCertFilePath
 		log.Infof("User specified cert provider: %v, mounted in a well known location %v",
-			features.PilotCertProvider.Get(), customCACertPath)
+			features.PilotCertProvider, customCACertPath)
 		caBundle, err = ioutil.ReadFile(customCACertPath)
 		if err != nil {
 			return fmt.Errorf("failed reading %s: %v", customCACertPath, err)

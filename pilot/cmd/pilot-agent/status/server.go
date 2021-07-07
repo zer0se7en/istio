@@ -34,6 +34,8 @@ import (
 	"time"
 
 	ocprom "contrib.go.opencensus.io/exporter/prometheus"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/hashicorp/go-multierror"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
@@ -41,8 +43,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"istio.io/istio/pilot/cmd/pilot-agent/metrics"
+	"istio.io/istio/pilot/cmd/pilot-agent/status/grpcready"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
 	"istio.io/istio/pilot/pkg/model"
+	nds "istio.io/istio/pilot/pkg/proto"
 	"istio.io/istio/pkg/kube/apimirror"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
@@ -106,6 +110,9 @@ type Options struct {
 	Probes              []ready.Prober
 	EnvoyPrometheusPort int
 	Context             context.Context
+	FetchDNS            func() *nds.NameTable
+	NoEnvoy             bool
+	GRPCBootstrap       string
 }
 
 // Server provides an endpoint for handling status probes.
@@ -119,6 +126,7 @@ type Server struct {
 	statusPort            uint16
 	lastProbeSuccessful   bool
 	envoyStatsPort        int
+	fetchDNS              func() *nds.NameTable
 }
 
 func init() {
@@ -143,17 +151,26 @@ func NewServer(config Options) (*Server, error) {
 		localhost = localHostIPv6
 	}
 	probes := make([]ready.Prober, 0)
-	probes = append(probes, &ready.Probe{
-		LocalHostAddr: localhost,
-		AdminPort:     config.AdminPort,
-		Context:       config.Context,
-	})
+	if !config.NoEnvoy {
+		probes = append(probes, &ready.Probe{
+			LocalHostAddr: localhost,
+			AdminPort:     config.AdminPort,
+			Context:       config.Context,
+			NoEnvoy:       config.NoEnvoy,
+		})
+	}
+
+	if config.GRPCBootstrap != "" {
+		probes = append(probes, grpcready.NewProbe(config.GRPCBootstrap))
+	}
+
 	probes = append(probes, config.Probes...)
 	s := &Server{
 		statusPort:            config.StatusPort,
 		ready:                 probes,
 		appProbersDestination: config.PodIP,
 		envoyStatsPort:        config.EnvoyPrometheusPort,
+		fetchDNS:              config.FetchDNS,
 	}
 	if LegacyLocalhostProbeDestination.Get() {
 		s.appProbersDestination = "localhost"
@@ -195,7 +212,7 @@ func NewServer(config Options) (*Server, error) {
 	// Validate the map key matching the regex pattern.
 	for path, prober := range s.appKubeProbers {
 		if !appProberPattern.Match([]byte(path)) {
-			return nil, fmt.Errorf(`invalid key, must be in form of regex pattern ^/app-health/[^\/]+/(livez|readyz)$`)
+			return nil, fmt.Errorf(`invalid key, must be in form of regex pattern %v`, appProberPattern)
 		}
 		if prober.HTTPGet == nil {
 			return nil, fmt.Errorf(`invalid prober type, must be of type httpGet`)
@@ -251,6 +268,7 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc("/debug/pprof/profile", s.handlePprofProfile)
 	mux.HandleFunc("/debug/pprof/symbol", s.handlePprofSymbol)
 	mux.HandleFunc("/debug/pprof/trace", s.handlePprofTrace)
+	mux.HandleFunc("/debug/ndsz", s.handleNdsz)
 
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", s.statusPort))
 	if err != nil {
@@ -522,8 +540,6 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		_, _ = w.Write([]byte(fmt.Sprintf("app prober config does not exists for %v", path)))
 		return
 	}
-	// get the http client must exist because
-	httpClient := s.appProbeClient[path]
 
 	proberPath := prober.HTTPGet.Path
 	if !strings.HasPrefix(proberPath, "/") {
@@ -565,6 +581,9 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// get the http client must exist because
+	httpClient := s.appProbeClient[path]
+
 	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
@@ -580,6 +599,37 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 
 	// We only write the status code to the response.
 	w.WriteHeader(response.StatusCode)
+}
+
+func (s *Server) handleNdsz(w http.ResponseWriter, r *http.Request) {
+	if !isRequestFromLocalhost(r) {
+		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
+		return
+	}
+	nametable := s.fetchDNS()
+	if nametable == nil {
+		// See https://golang.org/doc/faq#nil_error for why writeJSONProto cannot handle this
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{}`))
+		return
+	}
+	writeJSONProto(w, nametable)
+}
+
+// writeJSONProto writes a protobuf to a json payload, handling content type, marshaling, and errors
+func writeJSONProto(w http.ResponseWriter, obj proto.Message) {
+	w.Header().Set("Content-Type", "application/json")
+	buf := bytes.NewBuffer(nil)
+	err := (&jsonpb.Marshaler{Indent: "  "}).Marshal(buf, obj)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(err.Error()))
+		return
+	}
+	_, err = w.Write(buf.Bytes())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 }
 
 // notifyExit sends SIGTERM to itself

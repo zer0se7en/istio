@@ -15,9 +15,13 @@
 package v1alpha3
 
 import (
+	"crypto/md5"
+	"encoding/binary"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -44,16 +48,10 @@ import (
 	"istio.io/pkg/log"
 )
 
-// DisableGatewayPortTranslationLabel is a label on Service that declares that, for that particular
-// service, we should not translate Gateway ports to target ports. For example, if I have a Service
-// on port 80 with target port 8080, with the label. Gateways on port 80 would *not* match. Instead,
-// only Gateways on port 8080 would be used. This prevents ambiguities when there are multiple
-// Services on port 80 referring to different target ports. Long term, this will be replaced by
-// Gateways directly referencing a Service, rather than label selectors. Warning: this label is
-// intended solely for as a workaround for Knative's Istio integration, and not intended for any
-// other usage. It can, and will, be removed immediately after the new direct reference is ready for
-// use.
-const DisableGatewayPortTranslationLabel = "experimental.istio.io/disable-gateway-port-translation"
+type mutableListenerOpts struct {
+	mutable *MutableListener
+	opts    *buildListenerOpts
+}
 
 func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBuilder) *ListenerBuilder {
 	if builder.node.MergedGateway == nil {
@@ -66,41 +64,51 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 
 	actualWildcard, _ := getActualWildcardAndLocalHost(builder.node)
 	errs := istiomultierror.New()
-	listeners := make([]*listener.Listener, 0)
+	// Mutable objects keyed by listener name so that we can build listeners at the end.
+	mutableopts := make(map[string]mutableListenerOpts)
 	proxyConfig := builder.node.Metadata.ProxyConfigOrDefault(builder.push.Mesh.DefaultConfig)
-	for port, ms := range mergedGateway.MergedServers {
+	for _, port := range mergedGateway.ServerPorts {
+		ms := mergedGateway.MergedServers[port]
 		servers := ms.Servers
 		var si *model.ServiceInstance
-		services := make(map[host.Name]struct{}, len(builder.node.ServiceInstances))
-		foundDirectPortTranslation := false
-		for _, w := range builder.node.ServiceInstances {
-			_, directPortTranslation := w.Service.Attributes.Labels[DisableGatewayPortTranslationLabel]
-			if directPortTranslation {
-				if w.Endpoint.EndpointPort == port.Number {
-					foundDirectPortTranslation = true
+
+		// Legacy behavior; for new cases we will do this translation in the MergeGateway (which also applies to routes)
+		// TODO(Istio 1.12) remove this
+		if !features.UseTargetPortForGatewayRoutes {
+			services := make(map[host.Name]struct{}, len(builder.node.ServiceInstances))
+			foundDirectPortTranslation := false
+			for _, w := range builder.node.ServiceInstances {
+				_, directPortTranslation := w.Service.Attributes.Labels[model.DisableGatewayPortTranslationLabel]
+				if directPortTranslation {
+					if w.Endpoint.EndpointPort == port.Number {
+						foundDirectPortTranslation = true
+					}
+					continue
 				}
-				continue
-			}
-			if w.ServicePort.Port == int(port.Number) {
-				if si == nil {
-					si = w
+				if w.ServicePort.Port == int(port.Number) {
+					if si == nil {
+						si = w
+					}
+					services[w.Service.Hostname] = struct{}{}
 				}
-				services[w.Service.Hostname] = struct{}{}
 			}
-		}
-		if len(services) == 0 && foundDirectPortTranslation {
-			log.Debugf("buildGatewayListeners: using direct port mapping due to disable label for %v",
-				port.Number)
-		} else if len(services) != 1 {
-			log.Warnf("buildGatewayListeners: found %d services on port %d: %v",
-				len(services), port.Number, services)
+			if len(services) == 0 && foundDirectPortTranslation {
+				log.Debugf("buildGatewayListeners: using direct port mapping due to disable label for %v",
+					port.Number)
+			} else if len(services) != 1 {
+				log.Warnf("buildGatewayListeners: found %d services on port %d: %v",
+					len(services), port.Number, services)
+			}
+
+			// if we found a ServiceInstance with matching ServicePort, listen on TargetPort
+			if si != nil && si.Endpoint != nil {
+				port.Number = si.Endpoint.EndpointPort
+			}
 		}
 
-		// if we found a ServiceInstance with matching ServicePort, listen on TargetPort
-		if si != nil && si.Endpoint != nil {
-			port.Number = si.Endpoint.EndpointPort
-		}
-
+		// Skip ports we cannot bind to. Note that MergeGateways will already translate Service port to
+		// targetPort, which handles the common case of exposing ports like 80 and 443 but listening on
+		// higher numbered ports.
 		if builder.node.Metadata.UnprivilegedPod != "" && port.Number < 1024 {
 			log.Warnf("buildGatewayListeners: skipping privileged gateway port %d for node %s as it is an unprivileged pod",
 				port.Number, builder.node.ID)
@@ -113,7 +121,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 
 		// on a given port, we can either have plain text HTTP servers or
 		// HTTPS/TLS servers with SNI. We cannot have a mix of http and https server on same port.
-		opts := buildListenerOpts{
+		opts := &buildListenerOpts{
 			push:       builder.push,
 			proxy:      builder.node,
 			bind:       bind,
@@ -121,56 +129,61 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			bindToPort: true,
 			class:      ListenerClassGateway,
 		}
-
 		p := protocol.Parse(port.Protocol)
-		filterChains := make([]istionetworking.FilterChain, 0)
+		lname := opts.bind + "_" + strconv.Itoa(opts.port.Port)
+		newFilterChains := make([]istionetworking.FilterChain, 0)
 		if p.IsHTTP() {
 			// We have a list of HTTP servers on this port. Build a single listener for the server port.
 			// We only need to look at the first server in the list as the merge logic
 			// ensures that all servers are of same type.
 			port := &networking.Port{Number: port.Number, Protocol: port.Protocol}
 			opts.filterChainOpts = []*filterChainOpts{configgen.createGatewayHTTPFilterChainOpts(builder.node, port, nil, ms.RouteName, proxyConfig)}
-			filterChains = append(filterChains, istionetworking.FilterChain{ListenerProtocol: istionetworking.ListenerProtocolHTTP})
+			newFilterChains = append(newFilterChains, istionetworking.FilterChain{ListenerProtocol: istionetworking.ListenerProtocolHTTP})
 		} else {
 			// build http connection manager with TLS context, for HTTPS servers using simple/mutual TLS
 			// build listener with tcp proxy, with or without TLS context, for TCP servers
 			//   or TLS servers using simple/mutual/passthrough TLS
 			//   or HTTPS servers using passthrough TLS
 			// This process typically yields multiple filter chain matches (with SNI) [if TLS is used]
-			filterChainOpts := make([]*filterChainOpts, 0)
+			newFilterChainOpts := make([]*filterChainOpts, 0)
 
 			for _, server := range servers {
 				if gateway.IsTLSServer(server) && gateway.IsHTTPServer(server) {
 					routeName := mergedGateway.TLSServerInfo[server].RouteName
 					// This is a HTTPS server, where we are doing TLS termination. Build a http connection manager with TLS context
-					filterChainOpts = append(filterChainOpts, configgen.createGatewayHTTPFilterChainOpts(builder.node, server.Port, server,
+					newFilterChainOpts = append(newFilterChainOpts, configgen.createGatewayHTTPFilterChainOpts(builder.node, server.Port, server,
 						routeName, proxyConfig))
-					filterChains = append(filterChains, istionetworking.FilterChain{
+					newFilterChains = append(newFilterChains, istionetworking.FilterChain{
 						ListenerProtocol:   istionetworking.ListenerProtocolHTTP,
 						IstioMutualGateway: server.Tls.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL,
 					})
 				} else {
-					// passthrough or tcp, yields multiple filter chains
+					// This is the case of TCP or PASSTHROUGH.
 					tcpChainOpts := configgen.createGatewayTCPFilterChainOpts(builder.node, builder.push,
 						server, mergedGateway.GatewayNameForServer[server])
-					filterChainOpts = append(filterChainOpts, tcpChainOpts...)
+					newFilterChainOpts = append(newFilterChainOpts, tcpChainOpts...)
 					for i := 0; i < len(tcpChainOpts); i++ {
-						filterChains = append(filterChains, istionetworking.FilterChain{ListenerProtocol: istionetworking.ListenerProtocolTCP})
+						newFilterChains = append(newFilterChains, istionetworking.FilterChain{ListenerProtocol: istionetworking.ListenerProtocolTCP})
 					}
 				}
 			}
-			opts.filterChainOpts = filterChainOpts
+			opts.filterChainOpts = newFilterChainOpts
 		}
 
-		l := buildListener(opts, core.TrafficDirection_OUTBOUND)
-
-		mutable := &MutableListener{
-			MutableObjects: istionetworking.MutableObjects{
-				Listener: l,
-				// Note: buildListener creates filter chains but does not populate the filters in the chain; that's what
-				// this is for.
-				FilterChains: filterChains,
-			},
+		var mutable *MutableListener
+		if mopts, exists := mutableopts[lname]; !exists {
+			mutable = &MutableListener{
+				MutableObjects: istionetworking.MutableObjects{
+					// Note: buildListener creates filter chains but does not populate the filters in the chain; that's what
+					// this is for.
+					FilterChains: newFilterChains,
+				},
+			}
+			mutableopts[lname] = mutableListenerOpts{mutable: mutable, opts: opts}
+		} else {
+			mopts.opts.filterChainOpts = append(mopts.opts.filterChainOpts, opts.filterChainOpts...)
+			mopts.mutable.MutableObjects.FilterChains = append(mopts.mutable.MutableObjects.FilterChains, newFilterChains...)
+			mutable = mopts.mutable
 		}
 
 		pluginParams := &plugin.InputParams{
@@ -183,18 +196,21 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 				log.Warn("buildGatewayListeners: failed to build listener for gateway: ", err.Error())
 			}
 		}
-
+	}
+	listeners := make([]*listener.Listener, 0)
+	for _, ml := range mutableopts {
+		ml.mutable.Listener = buildListener(*ml.opts, core.TrafficDirection_OUTBOUND)
 		// Filters are serialized one time into an opaque struct once we have the complete list.
-		if err := mutable.build(opts); err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("gateway omitting listener %q due to: %v", mutable.Listener.Name, err.Error()))
+		if err := ml.mutable.build(*ml.opts); err != nil {
+			errs = multierror.Append(errs, fmt.Errorf("gateway omitting listener %q due to: %v", ml.mutable.Listener.Name, err.Error()))
 			continue
 		}
 
 		if log.DebugEnabled() {
 			log.Debugf("buildGatewayListeners: constructed listener with %d filter chains:\n%v",
-				len(mutable.Listener.FilterChains), mutable.Listener)
+				len(ml.mutable.Listener.FilterChains), ml.mutable.Listener)
 		}
-		listeners = append(listeners, mutable.Listener)
+		listeners = append(listeners, ml.mutable.Listener)
 	}
 	// We'll try to return any listeners we successfully marshaled; if we have none, we'll emit the error we built up
 	err := errs.ErrorOrNil()
@@ -203,7 +219,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 		log.Info(err.Error())
 	}
 
-	if len(listeners) == 0 {
+	if len(mutableopts) == 0 {
 		log.Warnf("gateway has zero listeners for node %v", builder.node.ID)
 		return builder
 	}
@@ -278,13 +294,13 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 	}
 
 	servers := merged.ServersByRouteName[routeName]
-	port := int(servers[0].Port.Number) // all these servers are for the same routeName, and therefore same port
 
 	gatewayRoutes := make(map[string]map[string][]*route.Route)
 	gatewayVirtualServices := make(map[string][]config.Config)
 	vHostDedupMap := make(map[host.Name]*route.VirtualHost)
 	for _, server := range servers {
 		gatewayName := merged.GatewayNameForServer[server]
+		port := int(server.Port.Number)
 
 		var virtualServices []config.Config
 		var exists bool
@@ -374,6 +390,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 
 	var virtualHosts []*route.VirtualHost
 	if len(vHostDedupMap) == 0 {
+		port := int(servers[0].Port.Number)
 		log.Warnf("constructed http route config for route %s on port %d with no vhosts; Setting up a default 404 vhost", routeName, port)
 		virtualHosts = []*route.VirtualHost{{
 			Name:    domainName("blackhole", port),
@@ -383,6 +400,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 		}}
 	} else {
 		virtualHosts = make([]*route.VirtualHost, 0, len(vHostDedupMap))
+		vHostDedupMap = collapseDuplicateRoutes(vHostDedupMap)
 		for _, v := range vHostDedupMap {
 			v.Routes = istio_route.CombineVHostRoutes(v.Routes)
 			virtualHosts = append(virtualHosts, v)
@@ -399,6 +417,89 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 	}
 
 	return routeCfg
+}
+
+// hashRouteList returns a hash of a list of pointers
+func hashRouteList(r []*route.Route) uint64 {
+	hash := md5.New()
+	for _, v := range r {
+		u := uintptr(unsafe.Pointer(v))
+		size := unsafe.Sizeof(u)
+		b := make([]byte, size)
+		switch size {
+		case 4:
+			binary.LittleEndian.PutUint32(b, uint32(u))
+		default:
+			binary.LittleEndian.PutUint64(b, uint64(u))
+		}
+		hash.Write(b)
+	}
+	var tmp [md5.Size]byte
+	sum := hash.Sum(tmp[:0])
+	return binary.LittleEndian.Uint64(sum)
+}
+
+// collapseDuplicateRoutes prevents cardinality explosion when we have multiple hostnames defined for the same set of routes
+// with virtual service: {hosts: [a, b], routes: [r1, r2]}
+// before: [{vhosts: [a], routes: [r1, r2]},{vhosts: [b], routes: [r1, r2]}]
+// after: [{vhosts: [a,b], routes: [r1, r2]}]
+// Note: At this point in the code, r1 and r2 are just pointers. However, once we send them over the wire
+// they are fully expanded and expensive, so the optimization is important.
+func collapseDuplicateRoutes(input map[host.Name]*route.VirtualHost) map[host.Name]*route.VirtualHost {
+	if !features.EnableRouteCollapse {
+		return input
+	}
+	dedupe := make(map[host.Name]*route.VirtualHost, len(input))
+	known := make(map[uint64]host.Name, len(input))
+
+	// In order to ensure stable XDS, we need to sort things. First vhost alphabetically will be the "primary"
+	var hostnameKeys host.Names = make([]host.Name, 0, len(input))
+	for k := range input {
+		hostnameKeys = append(hostnameKeys, k)
+	}
+	sort.Sort(hostnameKeys)
+	for _, h := range hostnameKeys {
+		vh := input[h]
+		hash := hashRouteList(vh.Routes)
+		eh, f := known[hash]
+		if f && vhostMergeable(vh, dedupe[eh]) {
+			// Merge domains, routes are identical. We check the hash *and* routesEqual so that we don't depend on not having
+			// collisions.
+			// routesEqual is fairly cheap, but not cheap enough to do n^2 checks, so both are needed
+			dedupe[eh].Domains = append(dedupe[eh].Domains, vh.Domains...)
+		} else {
+			known[hash] = h
+			dedupe[h] = vh
+		}
+	}
+	return dedupe
+}
+
+// vhostMergeable checks if two virtual hosts can be merged
+// We explicitly do not check domains or name, as those are the keys for the merge
+func vhostMergeable(a, b *route.VirtualHost) bool {
+	if a.IncludeRequestAttemptCount != b.IncludeRequestAttemptCount {
+		return false
+	}
+	if a.RequireTls != b.RequireTls {
+		return false
+	}
+	if !routesEqual(a.Routes, b.Routes) {
+		return false
+	}
+	return true
+}
+
+func routesEqual(a, b []*route.Route) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // builds a HTTP connection manager for servers of type HTTP or HTTPS (mode: simple/mutual)

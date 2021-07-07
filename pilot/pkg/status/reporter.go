@@ -82,20 +82,16 @@ const (
 
 // Init starts all the read only features of the reporter, used for nonce generation
 // and responding to istioctl wait.
-func (r *Reporter) Init(ledger ledger.Ledger) {
+func (r *Reporter) Init(ledger ledger.Ledger, stop <-chan struct{}) {
 	r.ledger = ledger
 	if r.clock == nil {
 		r.clock = clock.RealClock{}
-	}
-	// default UpdateInterval
-	if r.UpdateInterval == 0 {
-		r.UpdateInterval = 500 * time.Millisecond
 	}
 	r.distributionEventQueue = make(chan distributionEvent, 100_000)
 	r.status = make(map[string]string)
 	r.reverseStatus = make(map[string]map[string]struct{})
 	r.inProgressResources = make(map[string]*inProgressEntry)
-	go r.readFromEventQueue()
+	go r.readFromEventQueue(stop)
 }
 
 // Starts the reporter, which watches dataplane ack's and resource changes so that it can update status leader
@@ -306,10 +302,15 @@ func (r *Reporter) RegisterEvent(conID string, distributionType xds.EventType, n
 	}
 }
 
-func (r *Reporter) readFromEventQueue() {
-	for ev := range r.distributionEventQueue {
-		// TODO might need to batch this to prevent lock contention
-		r.processEvent(ev.conID, ev.distributionType, ev.nonce)
+func (r *Reporter) readFromEventQueue(stop <-chan struct{}) {
+	for {
+		select {
+		case ev := <-r.distributionEventQueue:
+			// TODO might need to batch this to prevent lock contention
+			r.processEvent(ev.conID, ev.distributionType, ev.nonce)
+		case <-stop:
+			return
+		}
 	}
 }
 

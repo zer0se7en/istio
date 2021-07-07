@@ -35,11 +35,14 @@ import (
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/trustbundle"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/spiffe"
+	"istio.io/istio/pkg/util/identifier"
 	"istio.io/pkg/ledger"
 	"istio.io/pkg/monitoring"
 )
@@ -534,12 +537,12 @@ type NodeMetadata struct {
 	MeshID string `json:"MESH_ID,omitempty"`
 
 	// ClusterID defines the cluster the node belongs to.
-	ClusterID string `json:"CLUSTER_ID,omitempty"`
+	ClusterID cluster.ID `json:"CLUSTER_ID,omitempty"`
 
 	// Network defines the network the node belongs to. It is an optional metadata,
 	// set at injection time. When set, the Endpoints returned to a node and not on same network
 	// will be replaced with the gateway defined in the settings.
-	Network string `json:"NETWORK,omitempty"`
+	Network network.ID `json:"NETWORK,omitempty"`
 
 	// RequestedNetworkView specifies the networks that the proxy wants to see
 	RequestedNetworkView StringList `json:"REQUESTED_NETWORK_VIEW,omitempty"`
@@ -616,36 +619,34 @@ func (m NodeMetadata) ProxyConfigOrDefault(def *meshconfig.ProxyConfig) *meshcon
 	return def
 }
 
-// UnnamedNetwork is the default network that proxies in the mesh
-// get when they don't request a specific network view.
-const UnnamedNetwork = ""
-
 // GetNetworkView returns the networks that the proxy requested.
 // When sending EDS/CDS-with-dns-endpoints, Pilot will only send
 // endpoints corresponding to the networks that the proxy wants to see.
 // If not set, we assume that the proxy wants to see endpoints in any network.
-func (node *Proxy) GetNetworkView() map[string]bool {
+func (node *Proxy) GetNetworkView() map[network.ID]bool {
 	if node == nil || len(node.Metadata.RequestedNetworkView) == 0 {
 		return nil
 	}
 
-	nmap := make(map[string]bool)
+	nmap := make(map[network.ID]bool)
 	for _, n := range node.Metadata.RequestedNetworkView {
-		nmap[n] = true
+		nmap[network.ID(n)] = true
 	}
-	nmap[UnnamedNetwork] = true
+	nmap[identifier.Undefined] = true
 
 	return nmap
 }
 
 // InNetwork returns true if the proxy is on the given network, or if either
 // the proxy's network or the given network is unspecified ("").
-func (node *Proxy) InNetwork(network string) bool {
-	return node == nil || IsSameNetwork(network, node.Metadata.Network)
+func (node *Proxy) InNetwork(network network.ID) bool {
+	return node == nil || identifier.IsSameOrEmpty(network.String(), node.Metadata.Network.String())
 }
 
-func IsSameNetwork(a, b string) bool {
-	return a == UnnamedNetwork || b == UnnamedNetwork || a == b
+// InCluster returns true if the proxy is in the given cluster, or if either
+// the proxy's cluster id or the given cluster id is unspecified ("").
+func (node *Proxy) InCluster(cluster cluster.ID) bool {
+	return node == nil || identifier.IsSameOrEmpty(cluster.String(), node.Metadata.ClusterID.String())
 }
 
 func (m *BootstrapNodeMetadata) UnmarshalJSON(data []byte) error {
@@ -760,26 +761,6 @@ func (node *Proxy) ServiceNode() string {
 	}, serviceNodeSeparator)
 }
 
-// RouterMode decides the behavior of Istio Gateway (normal or sni-dnat)
-type RouterMode string
-
-const (
-	// StandardRouter is the normal gateway mode
-	StandardRouter RouterMode = "standard"
-
-	// SniDnatRouter is used for bridging two networks
-	SniDnatRouter RouterMode = "sni-dnat"
-)
-
-// GetRouterMode returns the operating mode associated with the router.
-// Assumes that the proxy is of type Router
-func (node *Proxy) GetRouterMode() RouterMode {
-	if RouterMode(node.Metadata.RouterMode) == SniDnatRouter {
-		return SniDnatRouter
-	}
-	return StandardRouter
-}
-
 // SetSidecarScope identifies the sidecar scope object associated with this
 // proxy and updates the proxy Node. This is a convenience hack so that
 // callers can simply call push.Services(node) while the implementation of
@@ -807,6 +788,7 @@ func (node *Proxy) SetSidecarScope(ps *PushContext) {
 // proxy and caches the merged object in the proxy Node. This is a convenience hack so that
 // callers can simply call push.MergedGateways(node) instead of having to
 // fetch all the gateways and invoke the merge call in multiple places (lds/rds).
+// Must be called after ServiceInstances are set
 func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
 	if node.Type != Router {
 		return
@@ -838,7 +820,6 @@ func (node *Proxy) SetWorkloadLabels(env *Environment) {
 	if len(node.Metadata.Labels) > 0 {
 		return
 	}
-
 	// Fallback to calling GetProxyWorkloadLabels
 	l := env.GetProxyWorkloadLabels(node)
 	if len(l) > 0 {
@@ -1062,5 +1043,5 @@ func (node *Proxy) IsVM() bool {
 
 type GatewayController interface {
 	ConfigStoreCache
-	Recompute() error
+	Recompute(GatewayContext) error
 }

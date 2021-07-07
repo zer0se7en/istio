@@ -33,6 +33,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/pkg/util/sets"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/security"
@@ -90,9 +91,6 @@ type DiscoveryServer struct {
 	ProxyNeedsPush func(proxy *model.Proxy, req *model.PushRequest) bool
 
 	concurrentPushLimit chan struct{}
-	// mutex protecting global structs updated or read by ADS service, including ConfigsUpdated and
-	// shards.
-	mutex sync.RWMutex
 
 	// InboundUpdates describes the number of configuration updates the discovery server has received
 	InboundUpdates *atomic.Int64
@@ -103,13 +101,17 @@ type DiscoveryServer struct {
 	// the push context, which means that the next push to a proxy will receive this configuration.
 	CommittedUpdates *atomic.Int64
 
+	// mutex used for protecting shards.
+	mutex sync.RWMutex
 	// EndpointShards for a service. This is a global (per-server) list, built from
 	// incremental updates. This is keyed by service and namespace
 	EndpointShardsByService map[string]map[string]*EndpointShards
 
+	// pushChannel is the buffer used for debouncing.
+	// after debouncing the pushRequest will be sent to pushQueue
 	pushChannel chan *model.PushRequest
 
-	// mutex used for config update scheduling (former cache update mutex)
+	// mutex used for protecting Environment.PushContext
 	updateMutex sync.RWMutex
 
 	// pushQueue is the buffer that used after debounce and before the real xds push.
@@ -182,7 +184,7 @@ func NewDiscoveryServer(env *model.Environment, plugins []string, instanceID str
 		debounceOptions: debounceOptions{
 			debounceAfter:     features.DebounceAfter,
 			debounceMax:       features.DebounceMax,
-			enableEDSDebounce: features.EnableEDSDebounce.Get(),
+			enableEDSDebounce: features.EnableEDSDebounce,
 		},
 		Cache:      model.DisabledCache{},
 		instanceID: instanceID,
@@ -264,7 +266,7 @@ func (s *DiscoveryServer) getNonK8sRegistries() []serviceregistry.Instance {
 	}
 
 	for _, registry := range registries {
-		if registry.Provider() != serviceregistry.Kubernetes && registry.Provider() != serviceregistry.External {
+		if registry.Provider() != provider.Kubernetes && registry.Provider() != provider.External {
 			nonK8sRegistries = append(nonK8sRegistries, registry)
 		}
 	}
@@ -295,11 +297,23 @@ func (s *DiscoveryServer) periodicRefreshMetrics(stopCh <-chan struct{}) {
 	}
 }
 
+// dropCacheForRequest clears the cache in response to a push request
+func (s *DiscoveryServer) dropCacheForRequest(req *model.PushRequest) {
+	// If we don't know what updated, cannot safely cache. Clear the whole cache
+	if len(req.ConfigsUpdated) == 0 {
+		s.Cache.ClearAll()
+	} else {
+		// Otherwise, just clear the updated configs
+		s.Cache.Clear(req.ConfigsUpdated)
+	}
+}
+
 // Push is called to push changes on config updates using ADS. This is set in DiscoveryService.Push,
 // to avoid direct dependencies.
 func (s *DiscoveryServer) Push(req *model.PushRequest) {
 	if !req.Full {
 		req.Push = s.globalPushContext()
+		s.dropCacheForRequest(req)
 		s.AdsPushAll(versionInfo(), req)
 		return
 	}
@@ -317,9 +331,9 @@ func (s *DiscoveryServer) Push(req *model.PushRequest) {
 	if err != nil {
 		return
 	}
-
 	initContextTime := time.Since(t0)
 	log.Debugf("InitContext %v for push took %s", versionLocal, initContextTime)
+	pushContextInitTime.Record(initContextTime.Seconds())
 
 	versionMutex.Lock()
 	version = versionLocal
@@ -507,6 +521,8 @@ func (s *DiscoveryServer) initPushContext(req *model.PushRequest, oldPushContext
 
 	s.updateMutex.Lock()
 	s.Env.PushContext = push
+	// Ensure we drop the cache in the lock to avoid races, where we drop the cache, fill it back up, then update push context
+	s.dropCacheForRequest(req)
 	s.updateMutex.Unlock()
 
 	return push, nil
@@ -534,7 +550,7 @@ func (s *DiscoveryServer) initGenerators(env *model.Environment, systemNameSpace
 	s.Generators["grpc/"+v3.RouteType] = s.Generators["grpc"]
 	s.Generators["grpc/"+v3.ClusterType] = s.Generators["grpc"]
 
-	s.Generators["api"] = &apigen.APIGenerator{}
+	s.Generators["api"] = apigen.NewGenerator(env.IstioConfigStore)
 	s.Generators["api/"+v3.EndpointType] = edsGen
 
 	s.Generators["api/"+TypeURLConnect] = s.StatusGen

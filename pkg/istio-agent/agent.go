@@ -23,9 +23,11 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	bootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
@@ -37,11 +39,13 @@ import (
 	"istio.io/istio/pilot/cmd/pilot-agent/config"
 	"istio.io/istio/pilot/pkg/dns"
 	"istio.io/istio/pilot/pkg/model"
+	nds "istio.io/istio/pilot/pkg/proto"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/bootstrap"
 	"istio.io/istio/pkg/bootstrap/platform"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/envoy"
+	"istio.io/istio/pkg/istio-agent/grpcxds"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/nodeagent/cache"
 	"istio.io/istio/security/pkg/nodeagent/caclient"
@@ -176,6 +180,12 @@ type AgentOptions struct {
 
 	// Cloud platform
 	Platform platform.Environment
+
+	// GRPCBootstrapPath if set will generate a file compatible with GRPC_XDS_BOOTSTRAP
+	GRPCBootstrapPath string
+
+	// Disables all envoy agent features
+	DisableEnvoy bool
 }
 
 // NewAgent hosts the functionality for local SDS and XDS. This consists of the local SDS server and
@@ -191,10 +201,20 @@ func NewAgent(proxyConfig *mesh.ProxyConfig, agentOpts *AgentOptions, sopts *sec
 	}
 }
 
-func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
+// EnvoyDisabled if true inidcates calling Run will not run and wait for Envoy.
+func (a *Agent) EnvoyDisabled() bool {
+	return a.envoyOpts.TestOnly || a.cfg.DisableEnvoy
+}
+
+// WaitForSigterm if true indicates calling Run will block until SIGKILL is received.
+func (a *Agent) WaitForSigterm() bool {
+	return a.EnvoyDisabled() && !a.envoyOpts.TestOnly
+}
+
+func (a *Agent) generateNodeMetadata() (*model.Node, error) {
 	provCert, err := a.FindRootCAForXDS()
 	if err != nil {
-		return fmt.Errorf("failed to find root CA cert for XDS: %v", err)
+		return nil, fmt.Errorf("failed to find root CA cert for XDS: %v", err)
 	}
 
 	if provCert == "" {
@@ -210,7 +230,7 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 	}
 	log.Infof("Pilot SAN: %v", pilotSAN)
 
-	node, err := bootstrap.GetNodeMetaData(bootstrap.MetadataOptions{
+	return bootstrap.GetNodeMetaData(bootstrap.MetadataOptions{
 		ID:                  a.cfg.ServiceNode,
 		Envs:                os.Environ(),
 		Platform:            a.cfg.Platform,
@@ -224,6 +244,10 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 		EnvoyPrometheusPort: a.cfg.EnvoyPrometheusPort,
 		EnvoyStatusPort:     a.cfg.EnvoyStatusPort,
 	})
+}
+
+func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
+	node, err := a.generateNodeMetadata()
 	if err != nil {
 		return fmt.Errorf("failed to generate bootstrap metadata: %v", err)
 	}
@@ -267,6 +291,7 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 			// wait indefinitely and keep retrying with jittered exponential backoff
 			backoff := 500
 			max := 30000
+		retries:
 			for {
 				// handleStream hands on to request after exit, so create a fresh one instead.
 				request := &bootstrapDiscoveryRequest{
@@ -275,8 +300,10 @@ func (a *Agent) initializeEnvoyAgent(ctx context.Context) error {
 					envoyUpdate: envoyProxy.UpdateConfig,
 				}
 				_ = a.xdsProxy.handleStream(request)
-				if request.received {
-					break
+				select {
+				case <-a.envoyWaitCh:
+					break retries
+				default:
 				}
 				delay := time.Duration(rand.Int()%backoff) * time.Millisecond
 				log.Infof("retrying bootstrap discovery request with backoff: %v", delay)
@@ -384,7 +411,13 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 		}
 	}
 
-	if !a.envoyOpts.TestOnly {
+	if a.cfg.GRPCBootstrapPath != "" {
+		if err := a.generateGRPCBootstrap(); err != nil {
+			return nil, fmt.Errorf("failed generating gRPC XDS bootstrap: %v", err)
+		}
+	}
+
+	if !a.EnvoyDisabled() {
 		err = a.initializeEnvoyAgent(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start envoy agent: %v", err)
@@ -413,6 +446,15 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 			// This is a blocking call for graceful termination.
 			a.envoyAgent.Run(ctx)
 		}()
+	} else if a.WaitForSigterm() {
+		// wait for SIGTERM and perform graceful shutdown
+		stop := make(chan os.Signal)
+		signal.Notify(stop, syscall.SIGTERM)
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			<-stop
+		}()
 	}
 
 	return a.wg.Wait, nil
@@ -429,12 +471,39 @@ func (a *Agent) initLocalDNSServer() (err error) {
 	return nil
 }
 
+func (a *Agent) generateGRPCBootstrap() error {
+	// generate metadata
+	node, err := a.generateNodeMetadata()
+	if err != nil {
+		return fmt.Errorf("failed generating node metadata: %v", err)
+	}
+
+	_, err = grpcxds.GenerateBootstrapFile(grpcxds.GenerateBootstrapOptions{
+		Node:             node,
+		ProxyXDSViaAgent: a.cfg.ProxyXDSViaAgent,
+		XdsUdsPath:       a.cfg.XdsUdsPath,
+		DiscoveryAddress: a.proxyConfig.DiscoveryAddress,
+		CertDir:          a.secOpts.OutputKeyCertToDir,
+	}, a.cfg.GRPCBootstrapPath)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (a *Agent) Check() (err error) {
 	// we dont need dns server on gateways
 	if a.cfg.DNSCapture && a.cfg.ProxyXDSViaAgent && a.cfg.ProxyType == model.SidecarProxy {
 		if !a.localDNSServer.IsReady() {
 			return errors.New("istio DNS capture is turned ON and DNS lookup table is not ready yet")
 		}
+	}
+	return nil
+}
+
+func (a *Agent) GetDNSTable() *nds.NameTable {
+	if a.localDNSServer != nil {
+		return a.localDNSServer.NameTable()
 	}
 	return nil
 }
@@ -599,4 +668,9 @@ func (a *Agent) newSecretManager() (*cache.SecretManagerClient, error) {
 	}
 
 	return cache.NewSecretManagerClient(caClient, a.secOpts)
+}
+
+// GRPCBootstrapPath returns the most recently generated gRPC bootstrap or nil if there is none.
+func (a *Agent) GRPCBootstrapPath() string {
+	return a.cfg.GRPCBootstrapPath
 }

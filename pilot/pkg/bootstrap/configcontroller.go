@@ -17,7 +17,6 @@ package bootstrap
 import (
 	"fmt"
 	"net/url"
-	"time"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/galley/pkg/config/mesh"
@@ -287,10 +286,13 @@ func (s *Server) initInprocessAnalysisController(args *PilotArgs) error {
 
 func (s *Server) initStatusController(args *PilotArgs, writeStatus bool) {
 	s.statusReporter = &status.Reporter{
-		UpdateInterval: time.Millisecond * 500, // TODO: use args here?
+		UpdateInterval: features.StatusUpdateInterval,
 		PodName:        args.PodName,
 	}
-	s.statusReporter.Init(s.environment.GetLedger())
+	s.addStartFunc(func(stop <-chan struct{}) error {
+		s.statusReporter.Init(s.environment.GetLedger(), stop)
+		return nil
+	})
 	s.addTerminatingStartFunc(func(stop <-chan struct{}) error {
 		if writeStatus {
 			s.statusReporter.Start(s.kubeClient, args.Namespace, args.PodName, stop)
@@ -300,10 +302,12 @@ func (s *Server) initStatusController(args *PilotArgs, writeStatus bool) {
 	s.XDSServer.StatusReporter = s.statusReporter
 	if writeStatus {
 		s.addTerminatingStartFunc(func(stop <-chan struct{}) error {
-			controller := status.NewController(*s.kubeRestConfig, args.Namespace, s.RWConfigStore)
 			leaderelection.
 				NewLeaderElection(args.Namespace, args.PodName, leaderelection.StatusController, s.kubeClient).
 				AddRunFunction(func(stop <-chan struct{}) {
+					// Controller should be created for calling the run function every time, so it can
+					// avoid concurrently calling of informer Run() for controller in controller.Start
+					controller := status.NewController(s.kubeClient.RESTConfig(), args.Namespace, s.RWConfigStore)
 					s.statusReporter.SetController(controller)
 					controller.Start(stop)
 				}).Run(stop)

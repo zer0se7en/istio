@@ -23,7 +23,7 @@ import (
 	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
@@ -145,8 +145,9 @@ var httpDNSnoEndpoints = &config.Config{
 			{Number: 80, Name: "http-port", Protocol: "http"},
 			{Number: 8080, Name: "http-alt-port", Protocol: "http"},
 		},
-		Location:   networking.ServiceEntry_MESH_EXTERNAL,
-		Resolution: networking.ServiceEntry_DNS,
+		Location:        networking.ServiceEntry_MESH_EXTERNAL,
+		Resolution:      networking.ServiceEntry_DNS,
+		SubjectAltNames: []string{"google.com"},
 	},
 }
 
@@ -416,15 +417,16 @@ func convertPortNameToProtocol(name string) protocol.Instance {
 }
 
 func makeService(hostname host.Name, configNamespace, address string, ports map[string]int,
-	external bool, resolution model.Resolution) *model.Service {
+	external bool, resolution model.Resolution, serviceAccounts ...string) *model.Service {
 	svc := &model.Service{
-		CreationTime: GlobalTime,
-		Hostname:     hostname,
-		Address:      address,
-		MeshExternal: external,
-		Resolution:   resolution,
+		CreationTime:    GlobalTime,
+		Hostname:        hostname,
+		Address:         address,
+		MeshExternal:    external,
+		Resolution:      resolution,
+		ServiceAccounts: serviceAccounts,
 		Attributes: model.ServiceAttributes{
-			ServiceRegistry: serviceregistry.External,
+			ServiceRegistry: provider.External,
 			Name:            string(hostname),
 			Namespace:       configNamespace,
 		},
@@ -536,9 +538,9 @@ func TestConvertService(t *testing.T) {
 			externalSvc: httpDNSnoEndpoints,
 			services: []*model.Service{
 				makeService("google.com", "httpDNSnoEndpoints", constants.UnspecifiedIP,
-					map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
+					map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB, "google.com"),
 				makeService("www.wikipedia.org", "httpDNSnoEndpoints", constants.UnspecifiedIP,
-					map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
+					map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB, "google.com"),
 			},
 		},
 		{
